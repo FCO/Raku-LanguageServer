@@ -1,0 +1,143 @@
+use Test;
+use Raku::LanguageServer;
+use Raku::LanguageServer::Transport;
+
+# Refactorings offered as code actions, driven by the cursor or the selection
+# rather than by a diagnostic. Each is checked for the edits it produces, not
+# merely for being offered: a refactor that appears but edits the wrong span is
+# worse than one that never appears.
+
+my $out  = $*TMPDIR.add("rls-refactor-{$*PID}.bin");
+my $null = $*SPEC.devnull.IO;
+my $ofh  = $out.open(:w);
+my $ls   = Raku::LanguageServer.new(
+    transport => Raku::LanguageServer::Transport.new(:out($ofh), :in($null.open(:r))));
+
+my $code = q:to/CODE/;
+use Zebra;
+use Alpha;
+class Point {
+    has $.x;
+    has $!y;
+    method dist() {
+        my $scale = 2;
+        my $total = $.x * $scale;
+        if $total > 10 { say 'big' }
+        return $total;
+    }
+}
+CODE
+
+my $uri = 'file:///refactor.raku';
+my $id  = 100;
+my sub ask($l0, $c0, $l1 = $l0, $c1 = $c0) {
+    $ls.server.handle: {
+        jsonrpc => '2.0', id => $id++, method => 'textDocument/codeAction',
+        params => {
+            textDocument => { uri => $uri },
+            range => { start => { line => $l0, character => $c0 },
+                       end   => { line => $l1, character => $c1 } },
+            context => { diagnostics => [] },
+        },
+    };
+    $id - 1
+}
+
+$ls.server.handle: { jsonrpc => '2.0', id => 1, method => 'initialize', params => { capabilities => {} } };
+$ls.server.handle: { jsonrpc => '2.0', method => 'initialized', params => {} };
+$ls.server.handle: { jsonrpc => '2.0', method => 'textDocument/didOpen',
+    params => { textDocument => { uri => $uri, version => 1, text => $code } } };
+
+# line 7 is `    my $total = $.x * $scale;` — select `$.x * $scale`
+my $extract  = ask(7, 20, 7, 32);
+# cursor on `$scale` in its declaration on line 6
+my $inline   = ask(6, 12);
+# cursor on the `if` statement (line 8)
+my $postfix  = ask(8, 8);
+# cursor inside 'big' on line 8 (the string starts at column 29)
+my $quotes   = ask(8, 31);
+# cursor on the method declaration (line 5)
+my $export   = ask(5, 12);
+# cursor on `has $.x` (line 3) and `has $!y` (line 4)
+my $accessor = ask(3, 10);
+my $private  = ask(4, 10);
+# select the two statements in the method body
+my $wrap     = ask(6, 0, 7, 33);
+# the `use` block at the top is out of order
+my $organize = ask(0, 0);
+# a line with nothing to refactor, to prove the offers are not unconditional
+my $blank    = ask(11, 0);
+$ofh.close;
+
+my $read-fh = $out.open(:r);
+my $r = Raku::LanguageServer::Transport.new(:in($read-fh), :out($null.open(:w)));
+my %by-id;
+loop { my $m = $r.read-message; last unless $m.defined; %by-id{$m<id>} = $m if $m<id>:exists; }
+$read-fh.close;
+$out.unlink;
+
+my sub actions($n) { |(%by-id{$n}<result> // ()) }
+my sub titled($n, $want) { actions($n).first({ .<title>.contains($want) }) }
+my sub edits-of(%a) { |(%a<edit><changes>{$uri} // ()) }
+
+# --- extract to variable ------------------------------------------------------
+my %ev = titled($extract, 'Extract to variable') // %();
+ok %ev, 'a selection offers "Extract to variable"';
+is %ev<kind>, 'refactor.extract', 'with the extract kind';
+my @ev = edits-of(%ev);
+is @ev.elems, 2, 'it inserts a declaration and replaces the selection';
+like @ev[0]<newText>, /'my $extracted = ' '$.x * $scale' ';'/, 'the declaration holds the expression';
+is @ev[1]<newText>, '$extracted', 'and the selection becomes the variable';
+
+# --- extract to routine -------------------------------------------------------
+my %er = titled($extract, 'Extract to routine') // %();
+ok %er, 'a selection also offers "Extract to routine"';
+like edits-of(%er)[0]<newText>, /'sub extracted()'/, 'which declares a routine';
+
+# --- inline variable ----------------------------------------------------------
+my %iv = titled($inline, 'Inline') // %();
+ok %iv, 'a `my` declaration offers to inline it';
+is %iv<kind>, 'refactor.inline', 'with the inline kind';
+my @iv = edits-of(%iv);
+ok @iv.elems >= 2, 'removing the declaration and rewriting each use';
+is @iv[0]<newText>, '', 'the declaration is deleted';
+is @iv[1]<newText>, '(2)', 'and the use is replaced by the parenthesised value';
+
+# --- postfix if ---------------------------------------------------------------
+my %pf = titled($postfix, "postfix") // %();
+ok %pf, 'a single-statement `if` offers the postfix form';
+like edits-of(%pf)[0]<newText>, /"say 'big' if " '$total > 10;'/, 'rewritten as a modifier';
+
+# --- quotes -------------------------------------------------------------------
+my %q = titled($quotes, 'double quotes') // %();
+ok %q, 'a single-quoted string offers conversion to double quotes';
+is edits-of(%q)[0]<newText>, '"big"', 'with the same content';
+
+# --- is export ----------------------------------------------------------------
+my %ex = titled($export, 'is export') // %();
+ok %ex, 'a routine declaration offers "is export"';
+is edits-of(%ex)[0]<newText>, ' is export', 'appended to the signature';
+is edits-of(%ex)[0]<range><start><line>, 5, 'on the declaration line';
+
+# --- attribute accessor -------------------------------------------------------
+ok titled($accessor, 'private'), 'a public attribute offers to become private';
+ok titled($private, 'public accessor'), 'and a private one to gain an accessor';
+is edits-of(titled($accessor, 'private'))[0]<newText>, '!', 'flipping the twigil';
+
+# --- wrap in try --------------------------------------------------------------
+my %wt = titled($wrap, 'Wrap in try') // %();
+ok %wt, 'a selection offers to be wrapped in try';
+like edits-of(%wt)[0]<newText>, /'try {'/, 'producing a try block';
+
+# --- organize imports ---------------------------------------------------------
+my %oi = titled($organize, 'Sort use') // %();
+ok %oi, 'out-of-order `use` statements offer sorting';
+is %oi<kind>, 'source.organizeImports', 'under the organizeImports kind';
+is edits-of(%oi)[0]<newText>, "use Alpha;\nuse Zebra;", 'sorted alphabetically';
+
+# --- nothing is offered where it does not apply -------------------------------
+# A refactor must not appear just because the cursor is somewhere in the file.
+nok actions($blank).grep({ .<kind>.starts-with('refactor') }),
+    'no refactors are offered on a line that has none to give';
+
+done-testing;

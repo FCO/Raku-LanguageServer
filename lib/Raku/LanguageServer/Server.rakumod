@@ -85,12 +85,22 @@ method capabilities(--> Hash) {
         referencesProvider         => True,
         documentHighlightProvider  => True,
         documentFormattingProvider => True,
+        documentRangeFormattingProvider => True,
+        diagnosticProvider         => {
+            interFileDependencies => False,
+            workspaceDiagnostics  => False,
+        },
         foldingRangeProvider       => True,
         selectionRangeProvider     => True,
         inlayHintProvider          => True,
         callHierarchyProvider      => True,
         codeLensProvider           => { resolveProvider => False },
-        codeActionProvider         => { codeActionKinds => [ 'quickfix', 'source' ] },
+        codeActionProvider         => {
+            codeActionKinds => [
+                'quickfix', 'source', 'source.organizeImports',
+                'refactor', 'refactor.extract', 'refactor.inline', 'refactor.rewrite',
+            ],
+        },
         typeHierarchyProvider      => True,
         documentLinkProvider       => { resolveProvider => False },
         renameProvider             => { prepareProvider => True },

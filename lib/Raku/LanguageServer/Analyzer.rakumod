@@ -66,6 +66,19 @@ has @.workspace-roots is rw;
 #| answer to "which code did the user mean".
 has @.peer-uris is rw;
 
+#| Forget cached file contents. Called when the client reports files changing on
+#| disk: the mtime check catches edits made while the server runs, but a file
+#| deleted or created behind our back would otherwise linger in the cache.
+method forget-files(*@paths) {
+    if @paths {
+        %!file-text-cache{$_}:delete for @paths.map({ norm-path($_) });
+    }
+    else {
+        %!file-text-cache = ();
+        @!known-modules   = ();
+    }
+}
+
 #| Positional, hint-worthy parameter names (desigilized) of a runtime Signature,
 #| skipping the invocant, `%_`, named, and slurpy parameters.
 sub runtime-param-names($sig) {
@@ -463,6 +476,33 @@ method occurrences(Raku::LanguageServer::Document:D $doc) {
         }
     }
     @out
+}
+
+#| Top-level statements whose span begins inside a char range, as
+#| `{ node, from, to }`. Drives range formatting: a fragment cannot be deparsed
+#| on its own, but a whole statement can, and only statements that START in the
+#| selection are touched so a partly-selected one is left alone.
+method statements-in(Raku::LanguageServer::Document:D $doc, Int $from, Int $to) {
+    my $ast = $doc.ast orelse return [];
+    my @out;
+    my %seen;
+    sub visit($node) {
+        return unless $node ~~ RakuAST::Node;
+        if $node ~~ RakuAST::Statement {
+            with $node.origin -> $o {
+                if $o.defined && $from <= $o.from && $o.from < $to && $o.to > $o.from {
+                    my $key = "{$o.from}..{$o.to}";
+                    unless %seen{$key}++ {
+                        @out.push: %( node => $node, from => $o.from, to => $o.to );
+                        return;   # nested statements are formatted with their parent
+                    }
+                }
+            }
+        }
+        $node.visit-children(&visit);
+    }
+    visit($ast);
+    @out.sort({ .<from> }).Array
 }
 
 #| Deepest RakuAST node whose origin span contains the char offset. Used by

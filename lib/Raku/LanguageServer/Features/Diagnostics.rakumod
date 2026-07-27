@@ -1,5 +1,6 @@
 use v6.d;
 use Raku::LanguageServer::Document;
+use Raku::LanguageServer::Features::Support;
 use Raku::LanguageServer::Protocol;
 
 #| Publishes compile diagnostics for a document. Diagnostics come from the
@@ -92,6 +93,17 @@ sub diagnostics-for(Raku::LanguageServer::Document:D $doc --> Array) is export {
         }
     }
     @diags
+}
+
+#| Client-initiated ("pull") diagnostics. Same computation as the push flow;
+#| some editors prefer to ask rather than be told, and the LSP spec has both.
+sub register-diagnostic-request($server, $analyzer) is export {
+    $server.on-request: 'textDocument/diagnostic', -> %params, $srv {
+        with analyzed-doc($srv, $analyzer, %params) -> $doc {
+            %( kind => 'full', items => diagnostics-for($doc) )
+        }
+        else { %( kind => 'full', items => [] ) }
+    };
 }
 
 #| Compute and publish diagnostics for a document to the client.

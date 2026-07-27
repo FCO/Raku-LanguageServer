@@ -1,6 +1,7 @@
 use v6.d;
 use experimental :rakuast;
 use Raku::LanguageServer::Features::Support;
+use Raku::LanguageServer::Features::Refactor;
 
 #| Code actions. Diagnostic-driven quick-fixes read the FULL compiler message
 #| from `$doc.compile-error` (published diagnostics are shortened), so compiler
@@ -118,6 +119,12 @@ sub register-code-action($server, $analyzer) is export {
                 }
             }
             for beautify($doc) -> $action { @actions.push: $action }
+            @actions.append: refactor-actions($doc, $analyzer, %params);
+
+            # A client may ask for one kind only (`only: ['refactor.extract']`).
+            with %params<context><only> -> @only {
+                @actions .= grep({ @only.grep(-> $k { .<kind>.starts-with($k) }) }) if @only;
+            }
 
             [ @actions ]
         }

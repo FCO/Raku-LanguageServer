@@ -1,0 +1,86 @@
+use Test;
+use Raku::LanguageServer;
+use Raku::LanguageServer::Transport;
+
+# The LSP methods added alongside the refactorings: client-initiated ("pull")
+# diagnostics, range formatting, and the workspace notifications.
+
+my $out  = $*TMPDIR.add("rls-endpoints-{$*PID}.bin");
+my $null = $*SPEC.devnull.IO;
+my $ofh  = $out.open(:w);
+my $ls   = Raku::LanguageServer.new(
+    transport => Raku::LanguageServer::Transport.new(:out($ofh), :in($null.open(:r))));
+
+my $good = "my \$x=1;\nmy \$y   =   2;\nsay \$x+\$y;\n";
+my $bad  = "my \$x = ;\n";
+
+my $uri  = 'file:///endpoints.raku';
+my $buri = 'file:///broken.raku';
+
+$ls.server.handle: { jsonrpc => '2.0', id => 1, method => 'initialize', params => { capabilities => {} } };
+$ls.server.handle: { jsonrpc => '2.0', method => 'initialized', params => {} };
+$ls.server.handle: { jsonrpc => '2.0', method => 'textDocument/didOpen',
+    params => { textDocument => { uri => $uri, version => 1, text => $good } } };
+$ls.server.handle: { jsonrpc => '2.0', method => 'textDocument/didOpen',
+    params => { textDocument => { uri => $buri, version => 1, text => $bad } } };
+
+# pull diagnostics, on a clean and on a broken document
+$ls.server.handle: { jsonrpc => '2.0', id => 10, method => 'textDocument/diagnostic',
+    params => { textDocument => { uri => $uri } } };
+$ls.server.handle: { jsonrpc => '2.0', id => 11, method => 'textDocument/diagnostic',
+    params => { textDocument => { uri => $buri } } };
+
+# range formatting over the second line only
+$ls.server.handle: { jsonrpc => '2.0', id => 12, method => 'textDocument/rangeFormatting',
+    params => { textDocument => { uri => $uri },
+                range => { start => { line => 1, character => 0 },
+                           end   => { line => 1, character => 14 } },
+                options => { tabSize => 4, insertSpaces => True } } };
+
+# the workspace notifications must be accepted rather than error
+$ls.server.handle: { jsonrpc => '2.0', method => 'workspace/didChangeWatchedFiles',
+    params => { changes => [ { uri => 'file:///gone.rakumod', type => 3 } ] } };
+$ls.server.handle: { jsonrpc => '2.0', method => 'workspace/didChangeConfiguration',
+    params => { settings => {} } };
+
+# still serving requests after those notifications
+$ls.server.handle: { jsonrpc => '2.0', id => 13, method => 'textDocument/diagnostic',
+    params => { textDocument => { uri => $uri } } };
+$ofh.close;
+
+my $read-fh = $out.open(:r);
+my $r = Raku::LanguageServer::Transport.new(:in($read-fh), :out($null.open(:w)));
+my %by-id;
+loop { my $m = $r.read-message; last unless $m.defined; %by-id{$m<id>} = $m if $m<id>:exists; }
+$read-fh.close;
+$out.unlink;
+
+nok %by-id{$_}<error>, "request $_ succeeded" for 10, 11, 12, 13;
+
+# --- capabilities --------------------------------------------------------------
+my %caps = %by-id{1}<result><capabilities>;
+ok %caps<diagnosticProvider>,              'the diagnostic provider is advertised';
+ok %caps<documentRangeFormattingProvider>, 'so is range formatting';
+my $kinds = %caps<codeActionProvider><codeActionKinds>.Set;
+ok 'refactor.extract'      (elem) $kinds, 'extract refactors are advertised';
+ok 'refactor.inline'       (elem) $kinds, 'inline refactors are advertised';
+ok 'source.organizeImports' (elem) $kinds, 'and organizeImports';
+
+# --- pull diagnostics ----------------------------------------------------------
+is %by-id{10}<result><kind>, 'full', 'a diagnostic report is a full report';
+is %by-id{10}<result><items>.elems, 0, 'a clean document reports nothing';
+ok %by-id{11}<result><items>.elems, 'a broken one reports its compile error';
+ok %by-id{11}<result><items>[0]<message>, 'with a message';
+
+# --- range formatting ----------------------------------------------------------
+my @edits = |(%by-id{12}<result> // ());
+ok @edits.elems, 'range formatting returns an edit for the sloppy line';
+is @edits[0]<range><start><line>, 1, 'confined to the requested line';
+is @edits[0]<range><end><line>, 1, 'and it does not run past that line';
+unlike @edits[0]<newText>, /'say'/, 'the untouched lines are not part of the edit';
+
+# --- notifications are harmless -------------------------------------------------
+is %by-id{13}<result><kind>, 'full',
+    'the server still answers after the workspace notifications';
+
+done-testing;

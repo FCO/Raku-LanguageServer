@@ -1,0 +1,35 @@
+use Test;
+use JSON::Fast;
+
+# `mi6 build` regenerates META6.json from what it can see, and has already
+# dropped newly added modules once. A module missing from `provides` is invisible
+# to anything resolving through the META6 — including the tests, which fail with
+# a confusing "Could not find" rather than pointing at the metadata.
+
+my %meta = from-json('META6.json'.IO.slurp);
+my $provides = %meta<provides>;
+
+my @on-disk = 'lib'.IO.dir(:test(*.ends-with('.rakumod') || *.IO.d)).map({ .absolute });
+my @files = gather {
+    my @todo = 'lib'.IO;
+    while @todo {
+        my $dir = @todo.shift;
+        for $dir.dir -> $e {
+            if $e.d { @todo.push: $e }
+            elsif $e.extension eq 'rakumod' { take $e }
+        }
+    }
+}
+
+for @files -> $f {
+    my $rel = $f.relative('.');
+    my $mod = $rel.subst(/^ 'lib/'/, '').subst(/'.rakumod' $/, '').split('/').join('::');
+    # The unit declaration is the authority on the module's name; the path is
+    # only a convention (Features/Workspace.rakumod could declare anything).
+    my $declared = ($f.slurp ~~ / ^^ 'unit' \h+ ['module'|'class'|'role'|'grammar'] \h+
+                                    (<[\w:]>+) /) ?? ~$0 !! $mod;
+    ok $provides{$declared}:exists, "META6 provides $declared";
+    is $provides{$declared}, $rel, "  mapped to $rel" if $provides{$declared}:exists;
+}
+
+done-testing;
