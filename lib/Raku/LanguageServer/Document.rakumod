@@ -6,6 +6,29 @@ use Raku::LanguageServer::Position;
 #| with the parsed AST, extracted symbols, and any compile error.
 unit class Raku::LanguageServer::Document;
 
+#| One spelling for a path so comparisons hold: Windows reports `.absolute` with
+#| backslashes while URIs carry forward slashes, and the two must still compare
+#| equal when deciding whether two references mean the same file.
+sub norm-path(Str $p --> Str) is export { $p.subst(:g, '\\', '/') }
+
+#| Decode a `file://` URI to a filesystem path.
+sub uri-to-path(Str $uri --> Str) is export {
+    return $uri unless $uri.starts-with('file://');
+    my $p = $uri.subst(/^ 'file://' <-[/]>* /, '');   # drop scheme + optional authority
+    $p = $p.subst(:g, / '%' (<[0..9A..Fa..f]> ** 2) /, { chr(:16(~$0)) });
+    # `file:///C:/x` decodes to `/C:/x`, which is not a path Windows accepts.
+    $p .= subst(/^ '/' (<[A..Za..z]> ':')/, { ~$0 });
+    norm-path($p)
+}
+
+#| Encode a filesystem path as a `file://` URI. The extra slash matters on
+#| Windows: an absolute path there starts with a drive letter rather than `/`,
+#| so `file://` + `C:/x` would make `C:` look like the authority.
+sub path-to-uri(IO() $path --> Str) is export {
+    my $abs = norm-path($path.absolute);
+    $abs.starts-with('/') ?? "file://$abs" !! "file:///$abs"
+}
+
 has Str $.uri      is required;
 has Str $.text     is rw = '';
 has Int $.version  is rw = 0;

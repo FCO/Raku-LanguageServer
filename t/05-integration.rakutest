@@ -7,8 +7,10 @@ use Raku::LanguageServer::Transport;
 # to prove the wiring from JSON-RPC dispatch through the features.
 
 my $out-path = $*TMPDIR.add("rls-int-{$*PID}.bin");
-my $null     = "/dev/null".IO;
-my $transport = Raku::LanguageServer::Transport.new(:out($out-path.open(:w)), :in($null.open(:r)));
+my $null     = $*SPEC.devnull.IO;
+# Bound so it can be closed: Windows refuses to unlink a file with an open handle.
+my $write-fh  = $out-path.open(:w);
+my $transport = Raku::LanguageServer::Transport.new(:out($write-fh), :in($null.open(:r)));
 my $ls        = Raku::LanguageServer.new(:$transport);
 
 my $code = q:to/RAKU/;
@@ -37,6 +39,7 @@ $ls.server.handle: { jsonrpc => '2.0', id => 4, method => 'textDocument/definiti
 $transport.write-message: { jsonrpc => '2.0', method => '__end__' };   # sentinel
 
 # --- read every framed message back ---
+$write-fh.close;
 my $read-fh = $out-path.open(:r);
 my $reader = Raku::LanguageServer::Transport.new(:in($read-fh), :out($null.open(:w)));
 my (%by-id, @notifications);

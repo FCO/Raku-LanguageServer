@@ -134,27 +134,7 @@ method type-method-params(Raku::LanguageServer::Document:D $doc, Str $type-name,
 }
 
 #| Decode a `file://` URI to a filesystem path.
-method !uri-to-path(Str $uri --> Str) {
-    return $uri unless $uri.starts-with('file://');
-    my $p = $uri.subst(/^ 'file://' <-[/]>* /, '');   # drop scheme + optional authority
-    $p = $p.subst(:g, / '%' (<[0..9A..Fa..f]> ** 2) /, { chr(:16(~$0)) });
-    # `file:///C:/x` decodes to `/C:/x`, which is not a path Windows accepts.
-    $p .= subst(/^ '/' (<[A..Za..z]> ':')/, { ~$0 });
-    norm-path($p)
-}
-
-#| One spelling for a path so comparisons hold: Windows reports `.absolute` with
-#| backslashes while URIs carry forward slashes, and the two must still compare
-#| equal when deciding whether a candidate file is the buffer itself.
-sub norm-path(Str $p --> Str) { $p.subst(:g, '\\', '/') }
-
-#| Encode a filesystem path as a `file://` URI. The extra slash matters on
-#| Windows: an absolute path there starts with a drive letter rather than `/`,
-#| so `file://` + `C:/x` would make `C:` look like the authority.
-sub path-to-uri(IO() $path --> Str) {
-    my $abs = norm-path($path.absolute);
-    $abs.starts-with('/') ?? "file://$abs" !! "file:///$abs"
-}
+method !uri-to-path(Str $uri --> Str) { uri-to-path($uri) }
 
 #| The root directory of the project that owns a document — the nearest ancestor
 #| with a `META6.json`, found by walking up from the file. Nil for loose files.

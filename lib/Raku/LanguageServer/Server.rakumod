@@ -2,6 +2,7 @@ use v6.d;
 use Raku::LanguageServer::Transport;
 use Raku::LanguageServer::Protocol;
 use Raku::LanguageServer::Workspace;
+use Raku::LanguageServer::Document;
 
 #| The LSP server: owns the transport, the open-document workspace, and a
 #| registry of request/notification handlers. It enforces the LSP lifecycle
@@ -131,8 +132,7 @@ method !handle-initialize(%params) {
     # project-wide searches fall back on these.
     my @roots = |(%params<workspaceFolders> // ()).map({ .<uri> // Str }),
                 %params<rootUri> // Str;
-    @!workspace-roots = @roots.grep(*.defined)
-        .map({ .starts-with('file://') ?? .subst(/^ 'file://' <-[/]>* /, '') !! $_ })
+    @!workspace-roots = @roots.grep(*.defined).map({ uri-to-path($_) })
         .grep({ $_ && .IO.d })
         .unique;
 
