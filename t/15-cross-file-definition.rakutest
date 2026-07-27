@@ -186,7 +186,10 @@ nok @from-inside.grep({ .<uri> eq $iuri && .<range><start><line> == 1 }),
     "and never answers with the consumer the cursor is standing in";
 
 # --- the workspace root is honoured -------------------------------------------
-is $ls.server.workspace-roots, [ $*CWD.absolute ],
+# Compared in the server's own spelling: it normalises paths to forward slashes
+# so a path decoded from a URI and one from `.absolute` still compare equal,
+# and on Windows `.absolute` alone would use backslashes.
+is $ls.server.workspace-roots, [ $*CWD.absolute.subst(:g, '\\', '/') ],
     'the server records the workspace root reported at initialize';
 
 # --- implementations are ranked ------------------------------------------------
