@@ -1,0 +1,29 @@
+use Test;
+use Raku::LanguageServer::Transport;
+
+# Round-trips messages through a temp file, exercising the Content-Length
+# framing on both the write and read paths, including multi-byte UTF-8 bodies.
+
+my $path = $*TMPDIR.add("rls-transport-{$*PID}.bin");
+my $null = "/dev/null".IO;
+
+{
+    my $t = Raku::LanguageServer::Transport.new(:out($path.open(:w)), :in($null.open(:r)));
+    $t.write-message({ :jsonrpc('2.0'), :id(1), :method('initialize'),
+                       :params({ :emoji('snow ☃ party 🎉') }) });
+    $t.write-message({ :jsonrpc('2.0'), :id(2), :method('shutdown') });
+}
+
+my $reader = Raku::LanguageServer::Transport.new(:in($path.open(:r)), :out($null.open(:w)));
+my $m1 = $reader.read-message;
+my $m2 = $reader.read-message;
+my $m3 = $reader.read-message;
+
+is $m1<method>, 'initialize', 'first message method survives framing';
+is $m1<params><emoji>, 'snow ☃ party 🎉', 'multi-byte UTF-8 body round-trips intact';
+is $m2<method>, 'shutdown', 'second message read correctly';
+nok $m3.defined, 'clean EOF returns an undefined message';
+
+$path.unlink;
+
+done-testing;

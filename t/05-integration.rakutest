@@ -1,0 +1,72 @@
+use Test;
+use Raku::LanguageServer;
+use Raku::LanguageServer::Transport;
+
+# End-to-end: drive a scripted LSP session through the real Server and Transport
+# (responses are framed to a temp file, then read back with the Transport reader)
+# to prove the wiring from JSON-RPC dispatch through the features.
+
+my $out-path = $*TMPDIR.add("rls-int-{$*PID}.bin");
+my $null     = "/dev/null".IO;
+my $transport = Raku::LanguageServer::Transport.new(:out($out-path.open(:w)), :in($null.open(:r)));
+my $ls        = Raku::LanguageServer.new(:$transport);
+
+my $code = q:to/RAKU/;
+class Point {
+    has $.x;
+    method dist($o) { $o }
+}
+sub greet($name) { say $name }
+my $g = greet("hi");
+RAKU
+
+my $uri = 'file:///t.raku';
+my sub td { { uri => $uri } }
+
+$ls.server.handle: { jsonrpc => '2.0', id => 1, method => 'initialize',  params => { capabilities => {} } };
+$ls.server.handle: { jsonrpc => '2.0', method => 'initialized', params => {} };
+$ls.server.handle: { jsonrpc => '2.0', method => 'textDocument/didOpen',
+    params => { textDocument => { uri => $uri, languageId => 'raku', version => 1, text => $code } } };
+$ls.server.handle: { jsonrpc => '2.0', id => 2, method => 'textDocument/documentSymbol', params => { textDocument => td() } };
+# 'dist' is on line 2 (0-based), inside "    method dist($o)"
+$ls.server.handle: { jsonrpc => '2.0', id => 3, method => 'textDocument/hover',
+    params => { textDocument => td(), position => { line => 2, character => 12 } } };
+# definition of greet from its call on the last line
+$ls.server.handle: { jsonrpc => '2.0', id => 4, method => 'textDocument/definition',
+    params => { textDocument => td(), position => { line => 5, character => 9 } } };
+$transport.write-message: { jsonrpc => '2.0', method => '__end__' };   # sentinel
+
+# --- read every framed message back ---
+my $reader = Raku::LanguageServer::Transport.new(:in($out-path.open(:r)), :out($null.open(:w)));
+my (%by-id, @notifications);
+loop {
+    my $m = $reader.read-message;
+    last unless $m.defined;
+    last if ($m<method> // '') eq '__end__';
+    if $m<id>:exists { %by-id{$m<id>} = $m }
+    else             { @notifications.push: $m }
+}
+$out-path.unlink;
+
+# initialize
+ok %by-id{1}<result><capabilities><documentSymbolProvider>, 'initialize advertises documentSymbol capability';
+
+# diagnostics published on open (clean source ⇒ empty list)
+my $diag = @notifications.first({ .<method> eq 'textDocument/publishDiagnostics' });
+ok $diag, 'publishDiagnostics notification sent on didOpen';
+is $diag<params><diagnostics>.elems, 0, 'clean source ⇒ no diagnostics';
+
+# documentSymbol
+my @syms = |%by-id{2}<result>;
+ok @syms.grep(*.<name> eq 'Point'), 'documentSymbol returns class Point';
+ok @syms.grep(*.<name> eq 'greet'), 'documentSymbol returns sub greet';
+
+# hover
+ok %by-id{3}<result><contents><value>.contains('dist'), 'hover describes the method under the cursor';
+
+# definition points back into the same file
+my @defs = |%by-id{4}<result>;
+ok @defs.elems >= 1, 'definition resolves to at least one location';
+is @defs[0]<uri>, $uri, 'definition location is in the same document';
+
+done-testing;

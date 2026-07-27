@@ -1,0 +1,52 @@
+use Test;
+use Raku::LanguageServer;
+use Raku::LanguageServer::Transport;
+
+# Type hierarchy: supertypes (what a class `is`) and subtypes (classes that
+# `is` it), for `is`-based inheritance.
+
+my $out  = $*TMPDIR.add("rls-th-{$*PID}.bin");
+my $null = "/dev/null".IO;
+my $ofh  = $out.open(:w);
+my $ls   = Raku::LanguageServer.new(
+    transport => Raku::LanguageServer::Transport.new(:out($ofh), :in($null.open(:r))));
+
+my $code = q:to/CODE/;
+class Animal { }
+class Dog is Animal { }
+class Puppy is Dog { }
+class Kitten is Animal { }
+CODE
+
+my $uri = 'file:///th.raku';
+my $dog    = { uri => $uri, name => 'Dog',    data => { name => 'Dog' } };
+my $animal = { uri => $uri, name => 'Animal', data => { name => 'Animal' } };
+
+$ls.server.handle: { jsonrpc => '2.0', id => 1, method => 'initialize', params => { capabilities => {} } };
+$ls.server.handle: { jsonrpc => '2.0', method => 'initialized', params => {} };
+$ls.server.handle: { jsonrpc => '2.0', method => 'textDocument/didOpen',
+    params => { textDocument => { uri => $uri, version => 1, text => $code } } };
+$ls.server.handle: { jsonrpc => '2.0', id => 2, method => 'textDocument/prepareTypeHierarchy',
+    params => { textDocument => { uri => $uri }, position => { line => 1, character => 6 } } };
+$ls.server.handle: { jsonrpc => '2.0', id => 3, method => 'typeHierarchy/supertypes', params => { item => $dog } };
+$ls.server.handle: { jsonrpc => '2.0', id => 4, method => 'typeHierarchy/subtypes',   params => { item => $dog } };
+$ls.server.handle: { jsonrpc => '2.0', id => 5, method => 'typeHierarchy/subtypes',   params => { item => $animal } };
+$ofh.close;
+
+my $r = Raku::LanguageServer::Transport.new(:in($out.open(:r)), :out($null.open(:w)));
+my %by-id;
+loop { my $m = $r.read-message; last unless $m.defined; %by-id{$m<id>} = $m if $m<id>:exists; }
+$out.unlink;
+
+ok %by-id{1}<result><capabilities><typeHierarchyProvider>, 'typeHierarchy capability advertised';
+
+my @prep = |%by-id{2}<result>;
+is @prep.elems, 1, 'prepare returns one item for Dog';
+is @prep[0]<name>, 'Dog', 'the item is class Dog';
+is @prep[0]<kind>, 5, 'Dog is a Class (SymbolKind 5)';
+
+is %by-id{3}<result>.map(*.<name>).sort.join(','), 'Animal', 'supertype of Dog is Animal';
+is %by-id{4}<result>.map(*.<name>).sort.join(','), 'Puppy',  'subtype of Dog is Puppy';
+is %by-id{5}<result>.map(*.<name>).sort.join(','), 'Dog,Kitten'.split(',').sort.join(','), 'subtypes of Animal are Dog and Kitten';
+
+done-testing;

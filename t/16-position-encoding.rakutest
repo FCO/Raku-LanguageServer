@@ -1,0 +1,60 @@
+use Test;
+use Raku::LanguageServer;
+use Raku::LanguageServer::Transport;
+
+# The negotiated position encoding has to reach the documents, not just the
+# initialize response. Neovim offers utf-8 first, so the server would answer
+# "positionEncoding: utf-8" while every Document still measured in utf-16 —
+# every column on a line containing a non-ASCII character was then wrong in
+# both directions (requests resolved to the wrong token, replies pointed at the
+# wrong column).
+
+my $out  = $*TMPDIR.add("rls-enc-{$*PID}.bin");
+my $null = "/dev/null".IO;
+my $ofh  = $out.open(:w);
+my $ls   = Raku::LanguageServer.new(
+    transport => Raku::LanguageServer::Transport.new(:out($ofh), :in($null.open(:r))));
+
+# `café` is 4 chars, 4 utf-16 code units, but 5 utf-8 bytes — so the column of
+# anything after it differs between the two encodings.
+my $text = qq:to/CODE/;
+my \$café-count = 1;
+sub touché() \{ \$café-count \}
+CODE
+
+my $uri = 'file:///encoding.raku';
+
+$ls.server.handle: { jsonrpc => '2.0', id => 1, method => 'initialize',
+    params => { capabilities => { general => { positionEncodings => [ 'utf-8', 'utf-16' ] } } } };
+$ls.server.handle: { jsonrpc => '2.0', method => 'initialized', params => {} };
+$ls.server.handle: { jsonrpc => '2.0', method => 'textDocument/didOpen',
+    params => { textDocument => { uri => $uri, version => 1, text => $text } } };
+
+# `$café-count` on line 1 sits after `touché() { ` — utf-8 byte column.
+my $line1   = $text.lines[1];
+my $prefix  = $line1.substr(0, $line1.index('$café-count'));
+my $utf8col = $prefix.encode('utf-8').elems;
+$ls.server.handle: { jsonrpc => '2.0', id => 10, method => 'textDocument/definition',
+    params => { textDocument => { uri => $uri },
+                position => { line => 1, character => $utf8col + 2 } } };
+$ofh.close;
+
+my $r = Raku::LanguageServer::Transport.new(:in($out.open(:r)), :out($null.open(:w)));
+my %by-id;
+loop { my $m = $r.read-message; last unless $m.defined; %by-id{$m<id>} = $m if $m<id>:exists; }
+$out.unlink;
+
+is %by-id{1}<result><capabilities><positionEncoding>, 'utf-8',
+    'the server negotiates utf-8 when the client offers it';
+is $ls.server.workspace.encoding, 'utf-8',
+    'and the workspace adopts it';
+is $ls.server.workspace.get($uri).encoding, 'utf-8',
+    'so documents opened afterwards measure in the negotiated encoding';
+
+# The real consequence: a utf-8 column on a line with non-ASCII has to resolve
+# to the right identifier.
+my @locs = |(%by-id{10}<result> // ());
+is @locs.elems, 1, 'a position given in utf-8 columns resolves to the declaration';
+is @locs[0]<range><start><line>, 0, 'on the line where `$café-count` is declared';
+
+done-testing;

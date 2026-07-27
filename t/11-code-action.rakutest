@@ -1,0 +1,69 @@
+use Test;
+use Raku::LanguageServer;
+use Raku::LanguageServer::Transport;
+
+# Code actions: the diagnostic-driven quick-fixes and the beautify source action.
+
+my $null = "/dev/null".IO;
+my $uri  = 'file:///ca.raku';
+
+sub run-session(@handles) {
+    my $out = $*TMPDIR.add("rls-ca-{$*PID}-{(^99999).pick}.bin");
+    my $ofh = $out.open(:w);
+    my $ls  = Raku::LanguageServer.new(
+        transport => Raku::LanguageServer::Transport.new(:out($ofh), :in($null.open(:r))));
+    $ls.server.handle($_) for @handles;
+    $ofh.close;
+    my $r = Raku::LanguageServer::Transport.new(:in($out.open(:r)), :out($null.open(:w)));
+    my @msgs;
+    loop { my $m = $r.read-message; last unless $m.defined; @msgs.push($m) }
+    $out.unlink;
+    @msgs
+}
+
+#| Return the CodeActions for a buffer (feeding published diagnostics as context).
+sub actions-for(Str $code) {
+    my @init =
+        { jsonrpc => '2.0', id => 1, method => 'initialize', params => { capabilities => {} } },
+        { jsonrpc => '2.0', method => 'initialized', params => {} },
+        { jsonrpc => '2.0', method => 'textDocument/didOpen',
+          params => { textDocument => { uri => $uri, version => 1, text => $code } } };
+    my @m     = run-session(@init);
+    my @diags = |(@m.first({ (.<method> // '') eq 'textDocument/publishDiagnostics' })<params><diagnostics>);
+    my $range = @diags ?? @diags[0]<range> !! { start => { line => 0, character => 0 }, end => { line => 0, character => 0 } };
+    my @m2 = run-session((|@init,
+        { jsonrpc => '2.0', id => 2, method => 'textDocument/codeAction',
+          params => { textDocument => { uri => $uri }, range => $range,
+                      context => { diagnostics => @diags } } }));
+    |(@m2.first({ (.<id> // 0) == 2 })<result>)
+}
+
+# --- declare undeclared variable ---
+my @d = actions-for("sub f() \{\n    say \$undeclared;\n\}\n").grep(*.<title>.contains('Declare'));
+is @d.elems, 1, 'declare-var quick-fix offered';
+is @d[0]<kind>, 'quickfix', 'declare-var is a quickfix';
+my $edit = @d[0]<edit><changes>{$uri}[0];
+is $edit<range><start><line>, 1, 'declare inserts on the offending line';
+like $edit<newText>, /'my $undeclared;'/, 'declare inserts the my-declaration';
+
+# --- "Did you mean" spelling suggestion ---
+my @s = actions-for("my \$food = 1;\nsay \$foud;\n").grep(*.<title>.contains('Change'));
+ok @s, 'did-you-mean suggestion offered';
+like @s[0]<title>, /"'\$food'"/, 'suggestion targets the corrected name';
+
+# --- undeclared routine → stub ---
+my @r = actions-for("frobnicate(1, 2);\n").grep(*.<title>.contains('stub'));
+ok @r, 'routine-stub quick-fix offered';
+like @r[0]<edit><changes>{$uri}[0]<newText>, /'sub frobnicate'/, 'stub declares the sub';
+
+# --- undeclared type → add use ---
+my @u = actions-for("my Frobble \$x;\n").grep(*.<title>.contains('use'));
+ok @u, 'add-use quick-fix offered';
+like @u[0]<edit><changes>{$uri}[0]<newText>, /'use Frobble;'/, 'adds the use statement';
+
+# --- beautify source action on a valid buffer ---
+my @b = actions-for("my\$x=1;\n").grep(*.<kind> eq 'source');
+ok @b, 'beautify source action offered for a compiling buffer';
+like @b[0]<title>, /:i beautify/, 'beautify action is titled';
+
+done-testing;

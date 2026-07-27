@@ -1,0 +1,53 @@
+use Test;
+use Raku::LanguageServer;
+use Raku::LanguageServer::Transport;
+
+# Call hierarchy: prepare an item for a routine, then browse its callers
+# (incoming) and callees (outgoing).
+
+my $out  = $*TMPDIR.add("rls-ch-{$*PID}.bin");
+my $null = "/dev/null".IO;
+my $ofh  = $out.open(:w);
+my $ls   = Raku::LanguageServer.new(
+    transport => Raku::LanguageServer::Transport.new(:out($ofh), :in($null.open(:r))));
+
+my $code = q:to/CODE/;
+sub helper($x) { $x + 1 }
+sub compute($n) { helper($n) + helper($n * 2) }
+sub main() { compute(10) }
+CODE
+
+my $uri  = 'file:///ch.raku';
+my $item = { uri => $uri, name => 'compute', data => { name => 'compute' } };
+
+$ls.server.handle: { jsonrpc => '2.0', id => 1, method => 'initialize', params => { capabilities => {} } };
+$ls.server.handle: { jsonrpc => '2.0', method => 'initialized', params => {} };
+$ls.server.handle: { jsonrpc => '2.0', method => 'textDocument/didOpen',
+    params => { textDocument => { uri => $uri, version => 1, text => $code } } };
+$ls.server.handle: { jsonrpc => '2.0', id => 2, method => 'textDocument/prepareCallHierarchy',
+    params => { textDocument => { uri => $uri }, position => { line => 1, character => 6 } } };
+$ls.server.handle: { jsonrpc => '2.0', id => 3, method => 'callHierarchy/incomingCalls', params => { item => $item } };
+$ls.server.handle: { jsonrpc => '2.0', id => 4, method => 'callHierarchy/outgoingCalls', params => { item => $item } };
+$ofh.close;
+
+my $r = Raku::LanguageServer::Transport.new(:in($out.open(:r)), :out($null.open(:w)));
+my %by-id;
+loop { my $m = $r.read-message; last unless $m.defined; %by-id{$m<id>} = $m if $m<id>:exists; }
+$out.unlink;
+
+ok %by-id{1}<result><capabilities><callHierarchyProvider>, 'callHierarchy capability advertised';
+
+my @prep = |%by-id{2}<result>;
+is @prep.elems, 1, 'prepareCallHierarchy returns one item for compute';
+is @prep[0]<name>, 'compute', 'the item is the compute routine';
+
+my @in = |%by-id{3}<result>;
+is @in.elems, 1, 'compute has one caller';
+is @in[0]<from><name>, 'main', 'the caller is main';
+
+my @out = |%by-id{4}<result>;
+is @out.elems, 1, 'compute calls one distinct routine';
+is @out[0]<to><name>, 'helper', 'the callee is helper';
+is @out[0]<fromRanges>.elems, 2, 'helper is called twice from compute';
+
+done-testing;

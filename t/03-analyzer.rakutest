@@ -1,0 +1,52 @@
+use Test;
+use Raku::LanguageServer::Document;
+use Raku::LanguageServer::Analyzer;
+
+my $code = q:to/RAKU/;
+class Point {
+    has $.x;
+    method dist($o) { $o }
+}
+role Comparable { method cmp($o) { 0 } }
+sub greet($name) { say $name }
+my $g = greet("hi");
+RAKU
+
+my $doc = Raku::LanguageServer::Document.new(:uri<file:///t.raku>);
+$doc.update($code, 1);
+my $an = Raku::LanguageServer::Analyzer.new;
+$an.analyze($doc);
+
+nok $doc.compile-error.defined, 'clean source produces no compile error';
+ok $doc.ast.defined, 'AST cached';
+
+# --- symbol tree ---
+my @top = $doc.symbols;
+is @top.grep(*.name eq 'Point').elems, 1, 'class Point is a top-level symbol';
+is @top.grep(*.name eq 'greet').elems, 1, 'sub greet is a top-level symbol';
+is @top.grep(*.name eq '$g').elems, 1, 'my $g is a top-level symbol';
+
+my $point = @top.first(*.name eq 'Point');
+is $point.detail, 'class', 'Point classified as a class';
+ok $point.children.grep(*.name eq '$.x'), 'attribute $.x nested under Point';
+ok $point.children.grep(*.name eq 'dist'), 'method dist nested under Point';
+
+my $role = @top.first(*.name eq 'Comparable');
+ok $role, 'role Comparable is a top-level symbol';
+is $role.detail, 'role', 'Comparable classified as a role';
+ok $role.children.grep(*.name eq 'cmp'), 'method cmp nested under the role (role-body noise filtered)';
+
+# selection range points at just the name.
+is $code.substr($point.sel-from, $point.sel-to - $point.sel-from), 'Point', 'class selection range is the name';
+
+# --- identifier-at ---
+my $pos = $code.index('greet("hi")');
+my $id = $an.identifier-at($doc, $pos + 2);
+is $id<text>, 'greet', 'identifier-at finds the call name';
+
+# --- occurrences: greet declaration + call ---
+my @greet = $an.occurrences($doc).grep(*.<text> eq 'greet');
+is @greet.elems, 2, 'greet occurs twice (declaration + call)';
+is @greet.grep(*.<kind> eq 'decl').elems, 1, 'one of them is the declaration';
+
+done-testing;

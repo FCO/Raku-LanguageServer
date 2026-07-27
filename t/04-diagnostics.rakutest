@@ -1,0 +1,28 @@
+use Test;
+use Raku::LanguageServer::Document;
+use Raku::LanguageServer::Analyzer;
+use Raku::LanguageServer::Features::Diagnostics;
+
+my $doc = Raku::LanguageServer::Document.new(:uri<file:///t.raku>);
+my $an  = Raku::LanguageServer::Analyzer.new;
+
+# --- a malformed buffer produces a diagnostic ---
+$doc.update("my \$x = ;\nsay 'ok';", 1);
+$an.analyze($doc);
+ok $doc.compile-error.defined, 'compile error captured for malformed source';
+
+my @diags = diagnostics-for($doc);
+is @diags.elems, 1, 'one diagnostic reported';
+is @diags[0]<severity>, 1, 'severity is Error';
+is @diags[0]<source>, 'raku', 'source is "raku"';
+is @diags[0]<range><start><line>, 0, 'diagnostic points at the first line';
+ok @diags[0]<message>.chars, 'diagnostic carries a message';
+
+# --- fixing the buffer clears diagnostics and refreshes the AST ---
+$doc.update("my \$x = 42;\nsay \$x;", 2);
+$an.analyze($doc);
+nok $doc.compile-error.defined, 'no compile error after the fix';
+ok $doc.ast-current, 'AST matches the current text after the fix';
+is diagnostics-for($doc).elems, 0, 'diagnostics cleared';
+
+done-testing;

@@ -1,0 +1,28 @@
+use Test;
+use Raku::LanguageServer::Position;
+
+# UTF-16 position conversion, including an astral character (surrogate pair) and
+# multiple lines. Text: "aπ😀b\nx"
+#   offset: a=0  π=1  😀=2  b=3  \n=4  x=5
+#   utf-16 units on line 0: a=1, π=1, 😀=2, b=1
+my $text = "a\c[GREEK SMALL LETTER PI]\c[GRINNING FACE]b\nx";
+my $p = Raku::LanguageServer::Position.new(:$text);
+
+is-deeply $p.offset-to-position(0), { line => 0, character => 0 }, 'start of document';
+is-deeply $p.offset-to-position(1), { line => 0, character => 1 }, 'after ASCII "a"';
+is-deeply $p.offset-to-position(2), { line => 0, character => 2 }, 'after BMP "π" (1 unit)';
+is-deeply $p.offset-to-position(3), { line => 0, character => 4 }, 'after astral "😀" (2 units)';
+is-deeply $p.offset-to-position(4), { line => 0, character => 5 }, 'after "b"';
+is-deeply $p.offset-to-position(5), { line => 1, character => 0 }, 'start of second line';
+
+is $p.position-to-offset({ line => 0, character => 4 }), 3, 'position→offset accounts for surrogate pair';
+is $p.position-to-offset({ line => 1, character => 0 }), 5, 'position→offset on second line';
+
+# Clamping past end of line / document.
+is $p.position-to-offset({ line => 1, character => 99 }), 6, 'clamps past end of line';
+
+# CRLF newlines: "a\r\nb" — the \r\n pair is one grapheme, next line starts after it.
+my $crlf = Raku::LanguageServer::Position.new(text => "a\r\nb");
+is-deeply $crlf.offset-to-position(2), { line => 1, character => 0 }, 'CRLF: second line begins after the pair';
+
+done-testing;

@@ -1,0 +1,72 @@
+use Test;
+use Raku::LanguageServer;
+use Raku::LanguageServer::Transport;
+
+# Exercises the navigation features added on top of the core set: document
+# highlight, declaration, type definition, implementation, selection range,
+# and ranged semantic tokens — driven through the real Server.
+
+my $out  = $*TMPDIR.add("rls-nav-{$*PID}.bin");
+my $null = "/dev/null".IO;
+my $ofh  = $out.open(:w);
+my $ls   = Raku::LanguageServer.new(
+    transport => Raku::LanguageServer::Transport.new(:out($ofh), :in($null.open(:r))));
+
+my $code = q:to/CODE/;
+class Point {
+    has $.x;
+    method dist(Point $o) { $.x - $o.x }
+}
+my Point $p = Point.new;
+my $d = $p.dist($p);
+CODE
+
+my $uri = 'file:///nav.raku';
+my sub td { { uri => $uri } }
+my sub at($l, $c) { { textDocument => td(), position => { line => $l, character => $c } } }
+
+$ls.server.handle: { jsonrpc => '2.0', id => 1, method => 'initialize',  params => { capabilities => {} } };
+$ls.server.handle: { jsonrpc => '2.0', method => 'initialized', params => {} };
+$ls.server.handle: { jsonrpc => '2.0', method => 'textDocument/didOpen',
+    params => { textDocument => { uri => $uri, version => 1, text => $code } } };
+
+# capabilities advertised
+$ls.server.handle: { jsonrpc => '2.0', id => 10, method => 'textDocument/documentHighlight', params => at(4, 9) };
+$ls.server.handle: { jsonrpc => '2.0', id => 11, method => 'textDocument/declaration',       params => at(5, 11) };
+$ls.server.handle: { jsonrpc => '2.0', id => 12, method => 'textDocument/typeDefinition',    params => at(4, 9) };
+$ls.server.handle: { jsonrpc => '2.0', id => 13, method => 'textDocument/implementation',    params => at(2, 11) };
+$ls.server.handle: { jsonrpc => '2.0', id => 14, method => 'textDocument/selectionRange',
+    params => { textDocument => td(), positions => [ { line => 2, character => 27 } ] } };
+$ofh.close;
+
+my $r = Raku::LanguageServer::Transport.new(:in($out.open(:r)), :out($null.open(:w)));
+my %by-id;
+loop { my $m = $r.read-message; last unless $m.defined; %by-id{$m<id>} = $m if $m<id>:exists; }
+$out.unlink;
+
+# initialize advertises the new providers
+my %caps = %by-id{1}<result><capabilities>;
+ok %caps<documentHighlightProvider>, 'documentHighlight capability advertised';
+ok %caps<typeDefinitionProvider>,    'typeDefinition capability advertised';
+ok %caps<declarationProvider>,       'declaration capability advertised';
+ok %caps<selectionRangeProvider>,    'selectionRange capability advertised';
+
+# documentHighlight: $p declared (line 4) and used twice on line 5
+my @hl = |%by-id{10}<result>;
+is @hl.elems, 3, 'documentHighlight finds all occurrences of $p (1 decl + 2 uses)';
+ok @hl.first({ .<kind> == 3 }), 'declaration highlighted as Write';
+ok @hl.first({ .<kind> == 2 }), 'use highlighted as Read';
+
+# declaration of dist → the method declaration on line 2
+is %by-id{11}<result>[0]<range><start><line>, 2, 'declaration resolves to the method line';
+
+# typeDefinition of the Point-typed $p → the class declaration on line 0
+is %by-id{12}<result>[0]<range><start><line>, 0, 'typeDefinition jumps to the class';
+
+# implementation of dist → at least the method declaration
+ok %by-id{13}<result>.elems >= 1, 'implementation returns the routine declaration';
+
+# selectionRange: innermost has a widening parent chain
+ok %by-id{14}<result>[0]<parent>:exists, 'selectionRange has a widening parent chain';
+
+done-testing;

@@ -1,0 +1,10 @@
+#!/usr/bin/env raku
+use v6.d;
+use Raku::LanguageServer;
+
+#| Entry point for the Raku language server. Speaks LSP (JSON-RPC 2.0 over
+#| stdio Content-Length framing). Stdout carries protocol traffic only; all
+#| logging goes to stderr.
+sub MAIN() {
+    Raku::LanguageServer.new.run;
+}

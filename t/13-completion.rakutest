@@ -1,0 +1,204 @@
+use Test;
+use Raku::LanguageServer;
+use Raku::LanguageServer::Transport;
+
+# Context-aware completion, driven through the real Server. Two things are being
+# checked: that the offered set depends on where the cursor is rather than being
+# one undifferentiated list, and that what a `use`d module adds — exports and
+# custom `EXPORTHOW::DECLARE` declarators — shows up.
+
+my $out  = $*TMPDIR.add("rls-completion-{$*PID}.bin");
+my $null = "/dev/null".IO;
+my $ofh  = $out.open(:w);
+my $ls   = Raku::LanguageServer.new(
+    transport => Raku::LanguageServer::Transport.new(:out($ofh), :in($null.open(:r))));
+
+# The document is opened in a state that compiles and then edited into one that
+# does not — which is what actually happens while someone types `$g.`, and the
+# only way the last-good AST path gets exercised.
+my $good = q:to/CODE/;
+class Greeter {
+    has Str $.greeting;
+    method greet($who) { "$!greeting, $who" }
+}
+my Greeter $g = Greeter.new;
+my $count = 0;
+CODE
+my $edited = $good.subst('my $count = 0;', "my \$message = \$g.\nmy \$count = 0;");
+
+my $uri = 'file:///completion.raku';
+my sub at($u, $l, $c) { { textDocument => { uri => $u }, position => { line => $l, character => $c } } }
+
+$ls.server.handle: { jsonrpc => '2.0', id => 1, method => 'initialize', params => { capabilities => {} } };
+$ls.server.handle: { jsonrpc => '2.0', method => 'initialized', params => {} };
+$ls.server.handle: { jsonrpc => '2.0', method => 'textDocument/didOpen',
+    params => { textDocument => { uri => $uri, version => 1, text => $good } } };
+$ls.server.handle: { jsonrpc => '2.0', method => 'textDocument/didChange',
+    params => { textDocument => { uri => $uri, version => 2 }, contentChanges => [ { text => $edited } ] } };
+
+# line 5 is `my $message = $g.`, cursor just past the dot
+$ls.server.handle: { jsonrpc => '2.0', id => 10, method => 'textDocument/completion', params => at($uri, 5, 17) };
+# line 6 col 12: term position, after `my $count = `
+$ls.server.handle: { jsonrpc => '2.0', id => 11, method => 'textDocument/completion', params => at($uri, 6, 12) };
+# line 6 col 4: `my $` — variable position
+$ls.server.handle: { jsonrpc => '2.0', id => 12, method => 'textDocument/completion', params => at($uri, 6, 4) };
+
+# A second document next to a fixture module, so `use DeclFixture;` resolves via
+# the file's own directory.
+my $furi = "file://{$*CWD.absolute}/t/fixtures/probe.raku";
+$ls.server.handle: { jsonrpc => '2.0', method => 'textDocument/didOpen',
+    params => { textDocument => { uri => $furi, version => 1, text => "use DeclFixture;\n" } } };
+$ls.server.handle: { jsonrpc => '2.0', id => 13, method => 'textDocument/completion', params => at($furi, 1, 0) };
+
+# A third document in the shape config DSLs use — `config -> Outer $_ { .field = … }`
+# with a nested block, so the outer type has to come back once the inner closes.
+my $cfg = q:to/CODE/;
+use DeclFixture;
+config -> Outer $_ {
+    .aaa = 1;
+    .inner: -> Inner $_ {
+        .bbb = 2;
+    }
+    .ccc = 3;
+}
+CODE
+my $curi = "file://{$*CWD.absolute}/t/fixtures/topic.raku";
+$ls.server.handle: { jsonrpc => '2.0', method => 'textDocument/didOpen',
+    params => { textDocument => { uri => $curi, version => 1, text => $cfg } } };
+$ls.server.handle: { jsonrpc => '2.0', id => 14, method => 'textDocument/completion', params => at($curi, 2, 8) };
+$ls.server.handle: { jsonrpc => '2.0', id => 15, method => 'textDocument/completion', params => at($curi, 4, 12) };
+$ls.server.handle: { jsonrpc => '2.0', id => 16, method => 'textDocument/completion', params => at($curi, 6, 8) };
+
+# argument position: `.inner: ` passes a block over the nested type
+my $arg = "use DeclFixture;\nconfig -> Outer \$_ \{\n    .inner:\n    .inner: \n\}\n";
+my $auri = "file://{$*CWD.absolute}/t/fixtures/arg.raku";
+$ls.server.handle: { jsonrpc => '2.0', method => 'textDocument/didOpen',
+    params => { textDocument => { uri => $auri, version => 1, text => $arg } } };
+$ls.server.handle: { jsonrpc => '2.0', id => 17, method => 'textDocument/completion', params => at($auri, 2, 11) };
+# the same position but with the space already typed
+$ls.server.handle: { jsonrpc => '2.0', id => 18, method => 'textDocument/completion', params => at($auri, 3, 12) };
+$ofh.close;
+
+my $r = Raku::LanguageServer::Transport.new(:in($out.open(:r)), :out($null.open(:w)));
+my %by-id;
+loop { my $m = $r.read-message; last unless $m.defined; %by-id{$m<id>} = $m if $m<id>:exists; }
+$out.unlink;
+
+my sub items($id) { |(%by-id{$id}<result><items> // ()) }
+my sub labels($id) { items($id).map(*<label>).Set }
+
+nok %by-id{$_}<error>, "request $_ succeeded" for 10, 11, 12, 13, 14, 15, 16, 17, 18;
+
+# --- methods after a dot -----------------------------------------------------
+my $methods = labels(10);
+ok  $methods.elems,          'completion after `.` returns items';
+ok  'greet'  (elem) $methods, 'offers the method declared on the invocant type';
+nok 'class'  (elem) $methods, 'no keywords in method position';
+nok 'say'    (elem) $methods, 'no core routines in method position';
+is  items(10).first({ .<label> eq 'greet' })<kind>, 2, 'methods use CompletionItemKind Method';
+
+# --- term position -----------------------------------------------------------
+my $terms = labels(11);
+ok 'say'     (elem) $terms, 'term position offers core routines';
+ok 'class'   (elem) $terms, 'term position offers keywords';
+ok 'Greeter' (elem) $terms, 'term position offers what the buffer declares';
+ok $terms.elems > 200,      'core routines come from CORE:: introspection, not a short list';
+
+# locals must outrank the ~230 core routines and the keyword list
+my %term-items = items(11).map({ .<label> => $_ });
+ok %term-items<Greeter><sortText> lt %term-items<say><sortText>,
+    'declared names sort ahead of core routines';
+ok %term-items<say><sortText> lt %term-items<class><sortText>,
+    'core routines sort ahead of keywords';
+
+# --- variable position -------------------------------------------------------
+my $vars = labels(12);
+ok  $vars.elems,                        'completion after a sigil returns items';
+ok  $vars.keys.all.starts-with('$'),    'only same-sigil variables are offered';
+nok 'say' (elem) $vars,                 'no routines in variable position';
+
+# The replaced range has to cover the sigil, or the client filters `$fo` against
+# a sigil-less label and inserts a second sigil.
+my $var = items(12).head;
+ok $var<textEdit>:exists, 'variable items carry an explicit textEdit';
+is $var<textEdit><range><start><character>, 3, 'the edit range starts at the sigil';
+
+# --- what a used module contributes ------------------------------------------
+my $fixture = labels(13);
+ok 'widget' (elem) $fixture,
+    'custom EXPORTHOW::DECLARE declarator is offered as a keyword';
+ok 'fixture-helper' (elem) $fixture, 'exported routine from a used module is offered';
+ok 'FixtureType'    (elem) $fixture, 'exported type from a used module is offered';
+
+# --- leading-dot calls on a typed topic --------------------------------------
+my $topics = labels(14).Set;
+ok 'aaa' (elem) $topics, 'leading `.` completes against the typed topic';
+ok 'ccc' (elem) $topics, 'sibling fields of the topic type are offered';
+
+my $inner = labels(15).Set;
+ok 'bbb' (elem) $inner,  'a nested block completes against its own topic type';
+nok 'aaa' (elem) $inner, 'the outer type is not offered inside the nested block';
+
+my $reopened = labels(16).Set;
+ok 'ccc' (elem) $reopened,
+    'the outer topic type comes back once the nested block closes';
+
+# the type's own fields must outrank what it inherits from Any/Mu, and each item
+# has to say which class it came from
+my %topic-items = items(14).map({ .<label> => $_ });
+ok %topic-items<aaa><sortText> lt %topic-items<gist><sortText>,
+    'declared fields sort ahead of inherited methods';
+is %topic-items<aaa><labelDetails><description>, 'Outer',
+    "a class's own method is marked with that class";
+is %topic-items<aaa><detail>, 'local to Outer', 'and described as local to it';
+is %topic-items<gist><labelDetails><description>, 'Mu',
+    'an inherited method is marked with the class that declares it';
+like %topic-items<gist><detail>, /^ 'inherited from' /, 'and described as inherited';
+
+# Raku's object protocol is technically "own" but must not outrank real fields
+ok %topic-items<aaa><sortText> lt %topic-items<WHICH><sortText>,
+    'SHOUTY protocol methods sink below the fields';
+
+# --- parameters / field types shown on the item ------------------------------
+# An accessor's signature says nothing useful (`:($: *%_)`), so the attribute's
+# declared type is what gets shown.
+is %topic-items<aaa><labelDetails><detail>, 'Int',
+    "a field's declared type is shown beside its name";
+is %topic-items<inner><labelDetails><detail>, 'Inner',
+    'including when the field is a nested type';
+
+# --- argument position after `:` ---------------------------------------------
+my @arg-items = items(17);
+ok @arg-items.elems, 'completion after `.method: ` returns items';
+my $block = @arg-items.first({ .<label>.starts-with('->') });
+ok $block.defined, 'a block over the nested type is offered as the argument';
+is $block<insertTextFormat>, 2, 'it is a snippet';
+like $block<textEdit><newText>, / '-> Inner $_' /,
+    'the snippet is typed with the nested type';
+
+# A Callable is expected there, so what is offered is callables — the block forms
+# plus every routine in reach, `&`-sigiled so they read as references.
+my $arg-labels = @arg-items.map(*<label>).Set;
+ok '{ … }'      (elem) $arg-labels, 'a bare block is offered';
+ok '-> $_ { … }' (elem) $arg-labels, 'so is a block with a named topic';
+ok '&say'       (elem) $arg-labels, 'core routines are offered as callables';
+ok '&fixture-helper' (elem) $arg-labels, 'so are routines imported by the buffer';
+nok 'class'     (elem) $arg-labels, 'keywords are not callables and stay out';
+nok 'say'       (elem) $arg-labels, 'and routines appear only in their `&` form';
+
+# typing `say` has to still reach `&say`, which it cannot do by label alone
+is @arg-items.first({ .<label> eq '&say' })<filterText>, 'say',
+    'callables filter on the bare name';
+is @arg-items.first({ .<label> eq '&say' })<textEdit><newText>, ' &say',
+    'and insert the reference form';
+
+# `.inner:{ … }` is not the colon-call form, so the insertion supplies the space
+# the user has not typed yet — and must not double it when they have.
+nok @arg-items.grep({ !.<textEdit><newText>.starts-with(' ') }),
+    'a colon with no space after it inserts one';
+my @spaced = items(18);
+ok @spaced.elems, 'completion still fires with the space already typed';
+nok @spaced.grep({ .<textEdit><newText>.starts-with(' ') }),
+    'and nothing is padded a second time';
+
+done-testing;

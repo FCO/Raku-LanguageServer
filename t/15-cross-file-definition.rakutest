@@ -1,0 +1,220 @@
+use Test;
+use Raku::LanguageServer;
+use Raku::LanguageServer::Transport;
+
+# `gd` on a name declared in ANOTHER file. Definition used to search only the
+# current document's occurrences, so a class imported from a module produced
+# "No LSP Definitions found" — the single most common thing to jump to.
+
+my $out  = $*TMPDIR.add("rls-xfile-{$*PID}.bin");
+my $null = "/dev/null".IO;
+my $ofh  = $out.open(:w);
+my $ls   = Raku::LanguageServer.new(
+    transport => Raku::LanguageServer::Transport.new(:out($ofh), :in($null.open(:r))));
+
+# `Outer` and `fixture-helper` come from t/fixtures/DeclFixture.rakumod, and
+# `Deep::Nested::Thing` from t/fixtures/QualFixture.rakumod, which declares it
+# fully qualified. `local-one` is declared right here, so the local path stays
+# covered too.
+my $text = q:to/CODE/;
+use DeclFixture;
+use QualFixture;
+sub local-one() { 1 }
+my Outer $o;
+fixture-helper();
+local-one();
+my Deep::Nested::Thing $q;
+# NoSuchNameAnywhere
+CODE
+
+my $uri = "file://{$*CWD.absolute}/t/fixtures/xfile.raku";
+my sub at($l, $c) { { textDocument => { uri => $uri }, position => { line => $l, character => $c } } }
+
+# `rootUri` matters: a buffer opened from a dependency has no project of its own,
+# so project-wide searches fall back on what the editor calls the workspace.
+$ls.server.handle: { jsonrpc => '2.0', id => 1, method => 'initialize',
+    params => { capabilities => {}, rootUri => "file://{$*CWD.absolute}" } };
+$ls.server.handle: { jsonrpc => '2.0', method => 'initialized', params => {} };
+$ls.server.handle: { jsonrpc => '2.0', method => 'textDocument/didOpen',
+    params => { textDocument => { uri => $uri, version => 1, text => $text } } };
+
+$ls.server.handle: { jsonrpc => '2.0', id => 10, method => 'textDocument/definition', params => at(3, 4) };
+$ls.server.handle: { jsonrpc => '2.0', id => 11, method => 'textDocument/definition', params => at(4, 2) };
+$ls.server.handle: { jsonrpc => '2.0', id => 12, method => 'textDocument/definition', params => at(5, 2) };
+# a name that exists nowhere must come back empty rather than hang or throw
+$ls.server.handle: { jsonrpc => '2.0', id => 13, method => 'textDocument/definition', params => at(7, 4) };
+# declaration shares the handler, so it has to resolve across files too
+$ls.server.handle: { jsonrpc => '2.0', id => 14, method => 'textDocument/declaration', params => at(3, 4) };
+# cursor on the last segment of a qualified name, then on a middle one
+$ls.server.handle: { jsonrpc => '2.0', id => 15, method => 'textDocument/definition', params => at(6, 18) };
+$ls.server.handle: { jsonrpc => '2.0', id => 16, method => 'textDocument/definition', params => at(6, 12) };
+
+# A buffer that does NOT compile still has to find its own declarations rather
+# than falling through to another file that merely mentions the name.
+my $broken = "sub only-here() \{ 1 \}\nonly-here();\nmy Undeclared::Type \$x = ;\n";
+my $buri   = "file://{$*CWD.absolute}/t/fixtures/broken.raku";
+$ls.server.handle: { jsonrpc => '2.0', method => 'textDocument/didOpen',
+    params => { textDocument => { uri => $buri, version => 1, text => $broken } } };
+$ls.server.handle: { jsonrpc => '2.0', id => 17, method => 'textDocument/definition',
+    params => { textDocument => { uri => $buri }, position => { line => 1, character => 2 } } };
+
+# A type reached only TRANSITIVELY: this buffer uses Indirect::Front, which uses
+# Indirect::Leaf, which declares the marker. The name never appears among the
+# buffer's own `use` statements, so the lookup has to resolve the name itself as
+# a module. This is the `Cro::Transform` case — a file saying only `use Cro`.
+my $trans = "use Indirect::Front;\nmy Indirect::Leaf::Marker \$m;\n";
+my $turi  = "file://{$*CWD.absolute}/t/fixtures/deps/trans.raku";
+$ls.server.handle: { jsonrpc => '2.0', method => 'textDocument/didOpen',
+    params => { textDocument => { uri => $turi, version => 1, text => $trans } } };
+$ls.server.handle: { jsonrpc => '2.0', id => 18, method => 'textDocument/definition',
+    params => { textDocument => { uri => $turi }, position => { line => 1, character => 21 } } };
+# `gI` on a role: every package consuming it, across the project rather than
+# only the open buffer — and the cursor sits on one segment of the qualified
+# name, which used to match nothing against `does Deep::Nested::Thing`.
+$ls.server.handle: { jsonrpc => '2.0', id => 19, method => 'textDocument/implementation',
+    params => at(6, 18) };
+
+# `gI` from INSIDE a consumer must not answer with that consumer's own line.
+my $inside = "use QualFixture;\nclass MyConsumer does Deep::Nested::Thing \{ \}\n";
+my $iuri   = "file://{$*CWD.absolute}/t/fixtures/inside.raku";
+$ls.server.handle: { jsonrpc => '2.0', method => 'textDocument/didOpen',
+    params => { textDocument => { uri => $iuri, version => 1, text => $inside } } };
+$ls.server.handle: { jsonrpc => '2.0', id => 20, method => 'textDocument/implementation',
+    params => { textDocument => { uri => $iuri }, position => { line => 1, character => 38 } } };
+# `gI` from a buffer with no project of its own — a dependency under a `sources`
+# directory. Editors do not always give a workspace root (Neovim reports
+# root=nil there), so the projects of the other open buffers have to be used.
+my $dep = "role Deep::Nested::Thing \{ \}\n";
+my $depuri = "file://{$*TMPDIR.absolute}/rls-dep-{$*PID}/sources/abc123";
+$ls.server.handle: { jsonrpc => '2.0', method => 'textDocument/didOpen',
+    params => { textDocument => { uri => $depuri, version => 1, text => $dep } } };
+$ls.server.handle: { jsonrpc => '2.0', id => 21, method => 'textDocument/implementation',
+    params => { textDocument => { uri => $depuri }, position => { line => 0, character => 20 } } };
+# `gd` while standing ON a declaration: jumping to it would not move, so what
+# implements it is offered instead.
+my $ondecl = "use QualFixture;\nrole LocalRole \{ \}\nclass UsesIt does LocalRole \{ \}\n";
+my $oduri  = "file://{$*CWD.absolute}/t/fixtures/ondecl.raku";
+$ls.server.handle: { jsonrpc => '2.0', method => 'textDocument/didOpen',
+    params => { textDocument => { uri => $oduri, version => 1, text => $ondecl } } };
+# cursor on `LocalRole` in its own `role LocalRole { }` declaration
+$ls.server.handle: { jsonrpc => '2.0', id => 22, method => 'textDocument/definition',
+    params => { textDocument => { uri => $oduri }, position => { line => 1, character => 8 } } };
+# a declaration nothing implements must still answer with itself
+$ls.server.handle: { jsonrpc => '2.0', id => 23, method => 'textDocument/definition',
+    params => { textDocument => { uri => $oduri }, position => { line => 2, character => 8 } } };
+# `gr` must reach other files too, and must still report the buffer's own
+# occurrences when that buffer has no usable AST.
+$ls.server.handle: { jsonrpc => '2.0', id => 24, method => 'textDocument/references',
+    params => { textDocument => { uri => $uri }, position => at(3, 4)<position>,
+                context => { includeDeclaration => True } } };
+$ofh.close;
+
+my $r = Raku::LanguageServer::Transport.new(:in($out.open(:r)), :out($null.open(:w)));
+my %by-id;
+loop { my $m = $r.read-message; last unless $m.defined; %by-id{$m<id>} = $m if $m<id>:exists; }
+$out.unlink;
+
+my sub locs($id) { |(%by-id{$id}<result> // ()) }
+
+nok %by-id{$_}<error>, "request $_ succeeded" for 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24;
+
+# --- a type from a used module ------------------------------------------------
+my @type = locs(10);
+is @type.elems, 1, 'a class declared in another file resolves to one location';
+like @type[0]<uri>, /'DeclFixture.rakumod' $/, 'and it points at the defining file';
+ok @type[0]<range><start><line> > 0, 'with a real line in that file';
+
+# --- a routine from a used module ---------------------------------------------
+my @routine = locs(11);
+ok @routine.elems, 'a routine imported from another file also resolves';
+like @routine[0]<uri>, /'DeclFixture.rakumod' $/, 'to the file that declares it';
+
+# --- the local case must not regress ------------------------------------------
+my @local = locs(12);
+is @local.elems, 1, 'a name declared in the buffer still resolves locally';
+is @local[0]<uri>, $uri, 'and stays in the buffer rather than searching the project';
+
+# --- unknown names -------------------------------------------------------------
+is locs(13).elems, 0, 'an unknown name yields no locations';
+
+# --- declaration shares the behaviour -------------------------------------------
+like locs(14)[0]<uri>, /'DeclFixture.rakumod' $/, 'declaration resolves across files too';
+
+# --- qualified names ----------------------------------------------------------
+# QualFixture spells the name in full; a reference puts the cursor on one
+# segment, and either segment must still resolve.
+for 15, 16 -> $id {
+    my @q = locs($id);
+    ok @q.elems, "a qualified name resolves (request $id)";
+    like @q[0]<uri>, /'QualFixture.rakumod' $/, "  to the declaring file (request $id)";
+}
+
+# --- a buffer that does not compile -------------------------------------------
+my @broken-locs = locs(17);
+ok @broken-locs.elems, 'a local name resolves even while the buffer is broken';
+is @broken-locs[0]<uri>, $buri, 'and resolves within that buffer, not elsewhere';
+
+# --- a transitively reached type ----------------------------------------------
+my @trans-locs = locs(18);
+ok @trans-locs.elems, 'a type reached only through another module still resolves';
+like @trans-locs[0]<uri>, /'Leaf.rakumod' $/, 'to the file that actually declares it';
+
+# --- implementations of a role ------------------------------------------------
+my @impls = locs(19);
+my $impl-lines = @impls.map({ "{.<uri>.split('/').tail}:{.<range><start><line>}" }).Set;
+ok @impls.elems >= 2, 'gI on a role finds the packages that consume it';
+ok $impl-lines.keys.grep({ .starts-with('QualFixture.rakumod') }).elems >= 2,
+    'including consumers in the file that declares the role';
+# the doc comment above the consumers must not swallow the declaration after it
+ok @impls.grep({ .<range><start><line> == 10 }), 'a consumer right after a doc comment is still found';
+
+# --- gI from inside a consumer ------------------------------------------------
+my @from-inside = locs(20);
+ok @from-inside.elems, 'gI from inside a consumer still finds the other consumers';
+nok @from-inside.grep({ .<uri> eq $iuri && .<range><start><line> == 1 }),
+    "and never answers with the consumer the cursor is standing in";
+
+# --- the workspace root is honoured -------------------------------------------
+is $ls.server.workspace-roots, [ $*CWD.absolute ],
+    'the server records the workspace root reported at initialize';
+
+# --- implementations are ranked ------------------------------------------------
+# Test files consume roles too, but they are rarely the wanted answer, so
+# library code has to come first.
+my @ranked = locs(19).map({ .<uri> });
+if @ranked.grep({ .contains('/t/') }) && @ranked.grep({ !.contains('/t/') }) {
+    my $first-test = @ranked.first({ .contains('/t/') }, :k);
+    my $last-lib   = @ranked.pairs.grep({ !.value.contains('/t/') }).map(*.key).max;
+    ok $first-test > $last-lib, 'library implementations sort ahead of test ones';
+}
+else {
+    pass 'ranking not exercised: fixtures are all on one side';
+}
+
+# --- gI from a buffer that has no project of its own --------------------------
+my @from-dep = locs(21);
+ok @from-dep.elems, 'gI works from a dependency buffer with no project root';
+ok @from-dep.grep({ .<uri>.contains('QualFixture.rakumod') }),
+    'by falling back on the projects of the other open buffers';
+
+# --- gd on a declaration falls back to implementations ------------------------
+my @ondecl = locs(22);
+ok @ondecl.elems, 'gd on a role declaration returns something';
+nok @ondecl.grep({ .<uri> eq $oduri && .<range><start><line> == 1 }),
+    'not the declaration under the cursor, which would not move';
+ok @ondecl.grep({ .<uri> eq $oduri && .<range><start><line> == 2 }),
+    'but the class that consumes it';
+
+# a declaration with no implementations still answers with itself
+my @lonely = locs(23);
+is @lonely.elems, 1, 'a declaration nothing implements still resolves to itself';
+is @lonely[0]<range><start><line>, 2, 'on its own line';
+
+# --- references reach other files ---------------------------------------------
+my @refs = locs(24);
+ok @refs.elems, 'references returns occurrences';
+ok @refs.grep({ .<uri> eq $uri }), 'including the buffer itself';
+ok @refs.grep({ .<uri>.contains('DeclFixture.rakumod') }),
+    'and the declaring file in another module';
+
+done-testing;

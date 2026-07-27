@@ -1,0 +1,47 @@
+use Test;
+use Raku::LanguageServer;
+use Raku::LanguageServer::Transport;
+
+# Code lens: a "N references" annotation above each routine/package declaration.
+
+my $out  = $*TMPDIR.add("rls-cl-{$*PID}.bin");
+my $null = "/dev/null".IO;
+my $ofh  = $out.open(:w);
+my $ls   = Raku::LanguageServer.new(
+    transport => Raku::LanguageServer::Transport.new(:out($ofh), :in($null.open(:r))));
+
+my $code = q:to/CODE/;
+sub helper($x) { $x + 1 }
+sub compute($n) { helper($n) + helper($n * 2) }
+class Point { }
+sub main() { compute(10); compute(20) }
+CODE
+
+my $uri = 'file:///cl.raku';
+$ls.server.handle: { jsonrpc => '2.0', id => 1, method => 'initialize', params => { capabilities => {} } };
+$ls.server.handle: { jsonrpc => '2.0', method => 'initialized', params => {} };
+$ls.server.handle: { jsonrpc => '2.0', method => 'textDocument/didOpen',
+    params => { textDocument => { uri => $uri, version => 1, text => $code } } };
+$ls.server.handle: { jsonrpc => '2.0', id => 2, method => 'textDocument/codeLens', params => { textDocument => { uri => $uri } } };
+$ofh.close;
+
+my $r = Raku::LanguageServer::Transport.new(:in($out.open(:r)), :out($null.open(:w)));
+my %by-id;
+loop { my $m = $r.read-message; last unless $m.defined; %by-id{$m<id>} = $m if $m<id>:exists; }
+$out.unlink;
+
+ok %by-id{1}<result><capabilities><codeLensProvider>, 'codeLens capability advertised';
+
+my @lenses = |%by-id{2}<result>;
+my %title-by-line = @lenses.map({ .<range><start><line> => .<command><title> });
+
+is %title-by-line{0}, '2 references', 'helper called twice';
+is %title-by-line{1}, '2 references', 'compute called twice';
+is %title-by-line{2}, '0 references', 'unused class Point';
+is %title-by-line{3}, '0 references', 'main has no callers';
+
+# lens command carries showReferences arguments (uri, position, locations)
+is @lenses[0]<command><command>, 'editor.action.showReferences', 'lens uses showReferences command';
+is @lenses[0]<command><arguments>.elems, 3, 'command has uri, position, and locations';
+
+done-testing;

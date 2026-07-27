@@ -1,0 +1,48 @@
+use Test;
+use Raku::LanguageServer;
+use Raku::LanguageServer::Transport;
+
+# Inlay hints: inferred type annotations for untyped literals, and
+# parameter-name labels at call sites.
+
+my $out  = $*TMPDIR.add("rls-ih-{$*PID}.bin");
+my $null = "/dev/null".IO;
+my $ofh  = $out.open(:w);
+my $ls   = Raku::LanguageServer.new(
+    transport => Raku::LanguageServer::Transport.new(:out($ofh), :in($null.open(:r))));
+
+my $code = q:to/CODE/;
+sub add($a, $b) { $a + $b }
+my $n = 42;
+my $s = "hi";
+my $r = add(1, 2);
+CODE
+
+my $uri = 'file:///ih.raku';
+$ls.server.handle: { jsonrpc => '2.0', id => 1, method => 'initialize', params => { capabilities => {} } };
+$ls.server.handle: { jsonrpc => '2.0', method => 'initialized', params => {} };
+$ls.server.handle: { jsonrpc => '2.0', method => 'textDocument/didOpen',
+    params => { textDocument => { uri => $uri, version => 1, text => $code } } };
+$ls.server.handle: { jsonrpc => '2.0', id => 2, method => 'textDocument/inlayHint',
+    params => { textDocument => { uri => $uri },
+                range => { start => { line => 0, character => 0 }, end => { line => 10, character => 0 } } } };
+$ofh.close;
+
+my $r = Raku::LanguageServer::Transport.new(:in($out.open(:r)), :out($null.open(:w)));
+my %by-id;
+loop { my $m = $r.read-message; last unless $m.defined; %by-id{$m<id>} = $m if $m<id>:exists; }
+$out.unlink;
+
+ok %by-id{1}<result><capabilities><inlayHintProvider>, 'inlayHint capability advertised';
+
+my @hints = |%by-id{2}<result>;
+ok @hints, 'inlay hints returned';
+
+my @types  = @hints.grep(*.<kind> == 1);
+my @params = @hints.grep(*.<kind> == 2);
+
+ok @types.first({ .<label> eq ': Int' }), 'inferred type hint ": Int" for my $n = 42';
+ok @types.first({ .<label> eq ': Str' }), 'inferred type hint ": Str" for my $s = "hi"';
+is @params.map(*.<label>).sort.join(','), 'a:,b:', 'parameter-name hints for add(1, 2)';
+
+done-testing;

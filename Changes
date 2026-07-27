@@ -1,0 +1,9 @@
+Revision history for Raku::LanguageServer
+
+{{$NEXT}}
+    - Initial version: a RakuAST-powered Language Server Protocol server.
+    - JSON-RPC 2.0 over stdio with Content-Length framing; full lifecycle.
+    - Features: diagnostics, document/workspace symbols, hover, completion,
+      go-to-definition, references, rename, signature help, semantic tokens,
+      folding ranges, and deparse-based formatting.
+    - bin/raku-language-server entry point; editor wiring docs in the README.

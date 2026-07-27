@@ -1,0 +1,54 @@
+use Test;
+use Raku::LanguageServer::Document;
+use Raku::LanguageServer::Analyzer;
+
+# The server compiles a buffer with its owning project's lib/ on the module
+# path, so `use`d sibling modules resolve instead of producing false "Could not
+# find" diagnostics. The project root is the nearest ancestor with a META6.json.
+
+my $root = $*TMPDIR.add("rls-proj-{$*PID}");
+my $lib  = $root.add('lib');
+$lib.add('Proj').mkdir;
+$root.add('custom').mkdir;
+# One standard-layout module, and one with a non-standard provides path.
+$root.add('META6.json').spurt(
+    '{"name":"Proj","provides":{"Proj::A":"lib/Proj/A.rakumod","Proj::Custom":"custom/C.rakumod"}}');
+$lib.add('Proj/A.rakumod').spurt(q:to/CODE/);
+unit class Proj::A;
+method a { 42 }
+CODE
+$root.add('custom/C.rakumod').spurt("unit class Proj::Custom;\n");
+
+my $an = Raku::LanguageServer::Analyzer.new;
+
+sub analyze($rel, $text) {
+    my $doc = Raku::LanguageServer::Document.new(uri => 'file://' ~ $lib.add($rel).absolute);
+    $doc.update($text, 1);
+    $an.analyze($doc);
+    $doc;
+}
+
+my $b-src = q:to/CODE/;
+use Proj::A;
+unit class Proj::B;
+method b { Proj::A.new.a }
+CODE
+my $b = analyze('Proj/B.rakumod', $b-src);
+nok $b.compile-error.defined, 'sibling project module (use Proj::A) resolves via project lib';
+ok $b.ast.defined, 'AST produced for a buffer that uses a project module';
+
+# A module with a non-standard provides path resolves via META6.json.
+my $c = analyze('Proj/D.rakumod', "use Proj::Custom;\nunit class Proj::D;\n");
+nok $c.compile-error.defined, 'non-standard provides path resolves via META6.json';
+
+# A loose file outside any project still compiles (core deps via the default chain).
+my $loose = Raku::LanguageServer::Document.new(uri => 'file://' ~ $*TMPDIR.add("loose-{$*PID}.raku").absolute);
+$loose.update('my $x = 1; say $x;', 1);
+$an.analyze($loose);
+nok $loose.compile-error.defined, 'loose file with no project still compiles';
+
+# Syntax errors are still reported even with a project lib in play.
+my $bad = analyze('Proj/C.rakumod', 'my $x = ;');
+ok $bad.compile-error.defined, 'syntax error still reported inside a project';
+
+done-testing;

@@ -1,0 +1,66 @@
+use Test;
+use Raku::LanguageServer;
+use Raku::LanguageServer::Transport;
+
+# Two documents in sibling directories, each `use`ing a module that only exists
+# next to itself, analyzed by ONE long-running server — which is what an editor
+# does with two buffers open.
+#
+# `CompUnit::Repository::FileSystem` interns one instance per prefix process-wide
+# and ignores `next-repo` on a repeat `.new`. Both documents share the project
+# root and `lib` prefixes, so whichever built its chain last used to win, leaving
+# the other document's own directory orphaned: the second file could not find its
+# sibling module at all, and every feature that needs a resolved buffer went with
+# it. Opening A then B then A again is the shape that caught it.
+
+my $out  = $*TMPDIR.add("rls-siblings-{$*PID}.bin");
+my $null = "/dev/null".IO;
+my $ofh  = $out.open(:w);
+my $ls   = Raku::LanguageServer.new(
+    transport => Raku::LanguageServer::Transport.new(:out($ofh), :in($null.open(:r))));
+
+my $base = "file://{$*CWD.absolute}/t/fixtures";
+my $a-uri = "$base/projA/a.raku";
+my $b-uri = "$base/projB/b.raku";
+
+$ls.server.handle: { jsonrpc => '2.0', id => 1, method => 'initialize', params => { capabilities => {} } };
+$ls.server.handle: { jsonrpc => '2.0', method => 'initialized', params => {} };
+
+my sub open-doc($uri, $text, $version = 1) {
+    $ls.server.handle: { jsonrpc => '2.0', method => 'textDocument/didOpen',
+        params => { textDocument => { uri => $uri, version => $version, text => $text } } };
+}
+
+open-doc($a-uri, "use ModA;\nonly-in-a();\n");
+open-doc($b-uri, "use ModB;\nonly-in-b();\n");
+# re-analyze A after B has built its own chain
+$ls.server.handle: { jsonrpc => '2.0', method => 'textDocument/didChange',
+    params => { textDocument => { uri => $a-uri, version => 2 },
+                contentChanges => [ { text => "use ModA;\nonly-in-a();\n# touched\n" } ] } };
+$ofh.close;
+
+my $r = Raku::LanguageServer::Transport.new(:in($out.open(:r)), :out($null.open(:w)));
+my %diags;   # uri → the most recent diagnostics list for it
+loop {
+    my $m = $r.read-message;
+    last unless $m.defined;
+    %diags{$m<params><uri>} = $m<params><diagnostics>
+        if ($m<method> // '') eq 'textDocument/publishDiagnostics';
+}
+$out.unlink;
+
+my sub not-found($uri) {
+    (%diags{$uri} // []).grep({ .<message>.contains('Could not find') }).map({ .<message>.lines[0] })
+}
+
+# Without this the checks below would pass just as happily on a server that
+# published nothing at all.
+ok %diags{$a-uri}:exists, 'diagnostics were published for the first document';
+ok %diags{$b-uri}:exists, 'diagnostics were published for the second document';
+
+is not-found($b-uri), (),
+    'a document opened second still resolves the module in its own directory';
+is not-found($a-uri), (),
+    'and the first document still resolves its own after the second built a chain';
+
+done-testing;
