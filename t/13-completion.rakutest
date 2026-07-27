@@ -2,13 +2,21 @@ use Test;
 use Raku::LanguageServer;
 use Raku::LanguageServer::Transport;
 
+# `file://` + an absolute path is wrong on Windows, where a path starts with a
+# drive letter rather than `/`: `file://C:/x` makes `C:` the URI authority. The
+# extra slash keeps the drive inside the path.
+sub uri-of(Str $abs --> Str) {
+    my $p = $abs.subst(:g, '\\', '/');
+    $p.starts-with('/') ?? "file://$p" !! "file:///$p"
+}
+
 # Context-aware completion, driven through the real Server. Two things are being
 # checked: that the offered set depends on where the cursor is rather than being
 # one undifferentiated list, and that what a `use`d module adds — exports and
 # custom `EXPORTHOW::DECLARE` declarators — shows up.
 
 my $out  = $*TMPDIR.add("rls-completion-{$*PID}.bin");
-my $null = "/dev/null".IO;
+my $null = $*SPEC.devnull.IO;
 my $ofh  = $out.open(:w);
 my $ls   = Raku::LanguageServer.new(
     transport => Raku::LanguageServer::Transport.new(:out($ofh), :in($null.open(:r))));
@@ -45,7 +53,7 @@ $ls.server.handle: { jsonrpc => '2.0', id => 12, method => 'textDocument/complet
 
 # A second document next to a fixture module, so `use DeclFixture;` resolves via
 # the file's own directory.
-my $furi = "file://{$*CWD.absolute}/t/fixtures/probe.raku";
+my $furi = uri-of("{$*CWD.absolute}/t/fixtures/probe.raku");
 $ls.server.handle: { jsonrpc => '2.0', method => 'textDocument/didOpen',
     params => { textDocument => { uri => $furi, version => 1, text => "use DeclFixture;\n" } } };
 $ls.server.handle: { jsonrpc => '2.0', id => 13, method => 'textDocument/completion', params => at($furi, 1, 0) };
@@ -62,7 +70,7 @@ config -> Outer $_ {
     .ccc = 3;
 }
 CODE
-my $curi = "file://{$*CWD.absolute}/t/fixtures/topic.raku";
+my $curi = uri-of("{$*CWD.absolute}/t/fixtures/topic.raku");
 $ls.server.handle: { jsonrpc => '2.0', method => 'textDocument/didOpen',
     params => { textDocument => { uri => $curi, version => 1, text => $cfg } } };
 $ls.server.handle: { jsonrpc => '2.0', id => 14, method => 'textDocument/completion', params => at($curi, 2, 8) };
@@ -71,7 +79,7 @@ $ls.server.handle: { jsonrpc => '2.0', id => 16, method => 'textDocument/complet
 
 # argument position: `.inner: ` passes a block over the nested type
 my $arg = "use DeclFixture;\nconfig -> Outer \$_ \{\n    .inner:\n    .inner: \n\}\n";
-my $auri = "file://{$*CWD.absolute}/t/fixtures/arg.raku";
+my $auri = uri-of("{$*CWD.absolute}/t/fixtures/arg.raku");
 $ls.server.handle: { jsonrpc => '2.0', method => 'textDocument/didOpen',
     params => { textDocument => { uri => $auri, version => 1, text => $arg } } };
 $ls.server.handle: { jsonrpc => '2.0', id => 17, method => 'textDocument/completion', params => at($auri, 2, 11) };
@@ -79,9 +87,12 @@ $ls.server.handle: { jsonrpc => '2.0', id => 17, method => 'textDocument/complet
 $ls.server.handle: { jsonrpc => '2.0', id => 18, method => 'textDocument/completion', params => at($auri, 3, 12) };
 $ofh.close;
 
-my $r = Raku::LanguageServer::Transport.new(:in($out.open(:r)), :out($null.open(:w)));
+my $read-fh = $out.open(:r);
+
+my $r = Raku::LanguageServer::Transport.new(:in($read-fh), :out($null.open(:w)));
 my %by-id;
 loop { my $m = $r.read-message; last unless $m.defined; %by-id{$m<id>} = $m if $m<id>:exists; }
+$read-fh.close;
 $out.unlink;
 
 my sub items($id) { |(%by-id{$id}<result><items> // ()) }

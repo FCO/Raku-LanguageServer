@@ -37,7 +37,8 @@ $ls.server.handle: { jsonrpc => '2.0', id => 4, method => 'textDocument/definiti
 $transport.write-message: { jsonrpc => '2.0', method => '__end__' };   # sentinel
 
 # --- read every framed message back ---
-my $reader = Raku::LanguageServer::Transport.new(:in($out-path.open(:r)), :out($null.open(:w)));
+my $read-fh = $out-path.open(:r);
+my $reader = Raku::LanguageServer::Transport.new(:in($read-fh), :out($null.open(:w)));
 my (%by-id, @notifications);
 loop {
     my $m = $reader.read-message;
@@ -46,6 +47,7 @@ loop {
     if $m<id>:exists { %by-id{$m<id>} = $m }
     else             { @notifications.push: $m }
 }
+$read-fh.close;
 $out-path.unlink;
 
 # initialize

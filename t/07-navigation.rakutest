@@ -7,7 +7,7 @@ use Raku::LanguageServer::Transport;
 # and ranged semantic tokens — driven through the real Server.
 
 my $out  = $*TMPDIR.add("rls-nav-{$*PID}.bin");
-my $null = "/dev/null".IO;
+my $null = $*SPEC.devnull.IO;
 my $ofh  = $out.open(:w);
 my $ls   = Raku::LanguageServer.new(
     transport => Raku::LanguageServer::Transport.new(:out($ofh), :in($null.open(:r))));
@@ -39,9 +39,12 @@ $ls.server.handle: { jsonrpc => '2.0', id => 14, method => 'textDocument/selecti
     params => { textDocument => td(), positions => [ { line => 2, character => 27 } ] } };
 $ofh.close;
 
-my $r = Raku::LanguageServer::Transport.new(:in($out.open(:r)), :out($null.open(:w)));
+my $read-fh = $out.open(:r);
+
+my $r = Raku::LanguageServer::Transport.new(:in($read-fh), :out($null.open(:w)));
 my %by-id;
 loop { my $m = $r.read-message; last unless $m.defined; %by-id{$m<id>} = $m if $m<id>:exists; }
+$read-fh.close;
 $out.unlink;
 
 # initialize advertises the new providers

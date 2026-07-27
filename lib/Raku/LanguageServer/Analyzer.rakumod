@@ -137,7 +137,23 @@ method type-method-params(Raku::LanguageServer::Document:D $doc, Str $type-name,
 method !uri-to-path(Str $uri --> Str) {
     return $uri unless $uri.starts-with('file://');
     my $p = $uri.subst(/^ 'file://' <-[/]>* /, '');   # drop scheme + optional authority
-    $p.subst(:g, / '%' (<[0..9A..Fa..f]> ** 2) /, { chr(:16(~$0)) })
+    $p = $p.subst(:g, / '%' (<[0..9A..Fa..f]> ** 2) /, { chr(:16(~$0)) });
+    # `file:///C:/x` decodes to `/C:/x`, which is not a path Windows accepts.
+    $p .= subst(/^ '/' (<[A..Za..z]> ':')/, { ~$0 });
+    norm-path($p)
+}
+
+#| One spelling for a path so comparisons hold: Windows reports `.absolute` with
+#| backslashes while URIs carry forward slashes, and the two must still compare
+#| equal when deciding whether a candidate file is the buffer itself.
+sub norm-path(Str $p --> Str) { $p.subst(:g, '\\', '/') }
+
+#| Encode a filesystem path as a `file://` URI. The extra slash matters on
+#| Windows: an absolute path there starts with a drive letter rather than `/`,
+#| so `file://` + `C:/x` would make `C:` look like the authority.
+sub path-to-uri(IO() $path --> Str) {
+    my $abs = norm-path($path.absolute);
+    $abs.starts-with('/') ?? "file://$abs" !! "file:///$abs"
 }
 
 #| The root directory of the project that owns a document — the nearest ancestor
@@ -784,7 +800,7 @@ method references-across-files(Raku::LanguageServer::Document:D $doc, Str $name,
     my %seen;
     my @out;
     for self!project-files($doc) -> $path {
-        next if $path eq $self-path || %seen{$path}++;
+        next if norm-path($path) eq $self-path || %seen{$path}++;
         last if $scanned >= MAX-FILES-SCANNED;
         my $text = self!file-text($path);
         next unless $text.defined && $text.contains($name);
@@ -797,7 +813,7 @@ method references-across-files(Raku::LanguageServer::Document:D $doc, Str $name,
         }
         next unless @spans;
         my $other = Raku::LanguageServer::Document.new(
-            uri => "file://{$path.IO.absolute}", :$text);
+            uri => path-to-uri($path), :$text);
         for @spans -> ($from, $to) {
             @out.push: %( uri => $other.uri, range => $other.range($from, $to) );
         }
@@ -840,7 +856,7 @@ method consumers-of(Raku::LanguageServer::Document:D $doc, Str $name) {
     my $scanned   = 0;
     my %seen;
     for self!project-files($doc) -> $path {
-        next if $path eq $self-path || %seen{$path}++;
+        next if norm-path($path) eq $self-path || %seen{$path}++;
         last if $scanned >= MAX-FILES-SCANNED;
         my $text = self!file-text($path);
         next unless $text.defined && $text.contains($last);
@@ -849,7 +865,7 @@ method consumers-of(Raku::LanguageServer::Document:D $doc, Str $name) {
         my @spans = consumer-spans($text, $name);
         next unless @spans;
         my $other = Raku::LanguageServer::Document.new(
-            uri => "file://{$path.IO.absolute}", :$text);
+            uri => path-to-uri($path), :$text);
         for @spans -> ($from, $to) {
             @out.push: %( uri => $other.uri, range => $other.range($from, $to) );
         }
@@ -895,7 +911,7 @@ method cross-file-declarations(Raku::LanguageServer::Document:D $doc, Str $name)
     # Scan one file; True once the declaration is found.
     my &found-in = -> $path, Bool :$short --> Bool {
         my $ok = False;
-        if $path.defined && $path ne $self-path && !%seen-file{$path}++
+        if $path.defined && norm-path($path) ne $self-path && !%seen-file{$path}++
            && $scanned < MAX-FILES-SCANNED {
             my $text = self!file-text($path);
             # A file whose text does not even mention the name cannot declare it;
@@ -906,7 +922,7 @@ method cross-file-declarations(Raku::LanguageServer::Document:D $doc, Str $name)
                 if @spans {
                     # A Document purely for its coordinate index; NOT analyzed.
                     my $other = Raku::LanguageServer::Document.new(
-                        uri => "file://{$path.IO.absolute}", :$text);
+                        uri => path-to-uri($path), :$text);
                     for @spans -> ($from, $to) {
                         @out.push: %( uri => $other.uri, range => $other.range($from, $to) );
                     }

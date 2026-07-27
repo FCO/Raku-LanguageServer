@@ -2,6 +2,14 @@ use Test;
 use Raku::LanguageServer;
 use Raku::LanguageServer::Transport;
 
+# `file://` + an absolute path is wrong on Windows, where a path starts with a
+# drive letter rather than `/`: `file://C:/x` makes `C:` the URI authority. The
+# extra slash keeps the drive inside the path.
+sub uri-of(Str $abs --> Str) {
+    my $p = $abs.subst(:g, '\\', '/');
+    $p.starts-with('/') ?? "file://$p" !! "file:///$p"
+}
+
 # Two documents in sibling directories, each `use`ing a module that only exists
 # next to itself, analyzed by ONE long-running server — which is what an editor
 # does with two buffers open.
@@ -14,12 +22,12 @@ use Raku::LanguageServer::Transport;
 # it. Opening A then B then A again is the shape that caught it.
 
 my $out  = $*TMPDIR.add("rls-siblings-{$*PID}.bin");
-my $null = "/dev/null".IO;
+my $null = $*SPEC.devnull.IO;
 my $ofh  = $out.open(:w);
 my $ls   = Raku::LanguageServer.new(
     transport => Raku::LanguageServer::Transport.new(:out($ofh), :in($null.open(:r))));
 
-my $base = "file://{$*CWD.absolute}/t/fixtures";
+my $base = uri-of("{$*CWD.absolute}/t/fixtures");
 my $a-uri = "$base/projA/a.raku";
 my $b-uri = "$base/projB/b.raku";
 
@@ -39,7 +47,9 @@ $ls.server.handle: { jsonrpc => '2.0', method => 'textDocument/didChange',
                 contentChanges => [ { text => "use ModA;\nonly-in-a();\n# touched\n" } ] } };
 $ofh.close;
 
-my $r = Raku::LanguageServer::Transport.new(:in($out.open(:r)), :out($null.open(:w)));
+my $read-fh = $out.open(:r);
+
+my $r = Raku::LanguageServer::Transport.new(:in($read-fh), :out($null.open(:w)));
 my %diags;   # uri → the most recent diagnostics list for it
 loop {
     my $m = $r.read-message;
@@ -47,6 +57,7 @@ loop {
     %diags{$m<params><uri>} = $m<params><diagnostics>
         if ($m<method> // '') eq 'textDocument/publishDiagnostics';
 }
+$read-fh.close;
 $out.unlink;
 
 my sub not-found($uri) {

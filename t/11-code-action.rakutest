@@ -4,7 +4,7 @@ use Raku::LanguageServer::Transport;
 
 # Code actions: the diagnostic-driven quick-fixes and the beautify source action.
 
-my $null = "/dev/null".IO;
+my $null = $*SPEC.devnull.IO;
 my $uri  = 'file:///ca.raku';
 
 sub run-session(@handles) {
@@ -14,9 +14,11 @@ sub run-session(@handles) {
         transport => Raku::LanguageServer::Transport.new(:out($ofh), :in($null.open(:r))));
     $ls.server.handle($_) for @handles;
     $ofh.close;
-    my $r = Raku::LanguageServer::Transport.new(:in($out.open(:r)), :out($null.open(:w)));
+    my $read-fh = $out.open(:r);
+    my $r = Raku::LanguageServer::Transport.new(:in($read-fh), :out($null.open(:w)));
     my @msgs;
     loop { my $m = $r.read-message; last unless $m.defined; @msgs.push($m) }
+    $read-fh.close;
     $out.unlink;
     @msgs
 }

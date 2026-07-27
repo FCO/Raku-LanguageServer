@@ -2,6 +2,14 @@ use Test;
 use Raku::LanguageServer::Document;
 use Raku::LanguageServer::Analyzer;
 
+# `file://` + an absolute path is wrong on Windows, where a path starts with a
+# drive letter rather than `/`: `file://C:/x` makes `C:` the URI authority. The
+# extra slash keeps the drive inside the path.
+sub uri-of(Str $abs --> Str) {
+    my $p = $abs.subst(:g, '\\', '/');
+    $p.starts-with('/') ?? "file://$p" !! "file:///$p"
+}
+
 # The server compiles a buffer with its owning project's lib/ on the module
 # path, so `use`d sibling modules resolve instead of producing false "Could not
 # find" diagnostics. The project root is the nearest ancestor with a META6.json.
@@ -22,7 +30,7 @@ $root.add('custom/C.rakumod').spurt("unit class Proj::Custom;\n");
 my $an = Raku::LanguageServer::Analyzer.new;
 
 sub analyze($rel, $text) {
-    my $doc = Raku::LanguageServer::Document.new(uri => 'file://' ~ $lib.add($rel).absolute);
+    my $doc = Raku::LanguageServer::Document.new(uri => uri-of($lib.add($rel).absolute));
     $doc.update($text, 1);
     $an.analyze($doc);
     $doc;
@@ -42,7 +50,7 @@ my $c = analyze('Proj/D.rakumod', "use Proj::Custom;\nunit class Proj::D;\n");
 nok $c.compile-error.defined, 'non-standard provides path resolves via META6.json';
 
 # A loose file outside any project still compiles (core deps via the default chain).
-my $loose = Raku::LanguageServer::Document.new(uri => 'file://' ~ $*TMPDIR.add("loose-{$*PID}.raku").absolute);
+my $loose = Raku::LanguageServer::Document.new(uri => uri-of($*TMPDIR.add("loose-{$*PID}.raku").absolute));
 $loose.update('my $x = 1; say $x;', 1);
 $an.analyze($loose);
 nok $loose.compile-error.defined, 'loose file with no project still compiles';

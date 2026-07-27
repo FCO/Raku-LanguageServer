@@ -2,12 +2,20 @@ use Test;
 use Raku::LanguageServer;
 use Raku::LanguageServer::Transport;
 
+# `file://` + an absolute path is wrong on Windows, where a path starts with a
+# drive letter rather than `/`: `file://C:/x` makes `C:` the URI authority. The
+# extra slash keeps the drive inside the path.
+sub uri-of(Str $abs --> Str) {
+    my $p = $abs.subst(:g, '\\', '/');
+    $p.starts-with('/') ?? "file://$p" !! "file:///$p"
+}
+
 # `gd` on a name declared in ANOTHER file. Definition used to search only the
 # current document's occurrences, so a class imported from a module produced
 # "No LSP Definitions found" — the single most common thing to jump to.
 
 my $out  = $*TMPDIR.add("rls-xfile-{$*PID}.bin");
-my $null = "/dev/null".IO;
+my $null = $*SPEC.devnull.IO;
 my $ofh  = $out.open(:w);
 my $ls   = Raku::LanguageServer.new(
     transport => Raku::LanguageServer::Transport.new(:out($ofh), :in($null.open(:r))));
@@ -27,13 +35,13 @@ my Deep::Nested::Thing $q;
 # NoSuchNameAnywhere
 CODE
 
-my $uri = "file://{$*CWD.absolute}/t/fixtures/xfile.raku";
+my $uri = uri-of("{$*CWD.absolute}/t/fixtures/xfile.raku");
 my sub at($l, $c) { { textDocument => { uri => $uri }, position => { line => $l, character => $c } } }
 
 # `rootUri` matters: a buffer opened from a dependency has no project of its own,
 # so project-wide searches fall back on what the editor calls the workspace.
 $ls.server.handle: { jsonrpc => '2.0', id => 1, method => 'initialize',
-    params => { capabilities => {}, rootUri => "file://{$*CWD.absolute}" } };
+    params => { capabilities => {}, rootUri => uri-of("{$*CWD.absolute}") } };
 $ls.server.handle: { jsonrpc => '2.0', method => 'initialized', params => {} };
 $ls.server.handle: { jsonrpc => '2.0', method => 'textDocument/didOpen',
     params => { textDocument => { uri => $uri, version => 1, text => $text } } };
@@ -52,7 +60,7 @@ $ls.server.handle: { jsonrpc => '2.0', id => 16, method => 'textDocument/definit
 # A buffer that does NOT compile still has to find its own declarations rather
 # than falling through to another file that merely mentions the name.
 my $broken = "sub only-here() \{ 1 \}\nonly-here();\nmy Undeclared::Type \$x = ;\n";
-my $buri   = "file://{$*CWD.absolute}/t/fixtures/broken.raku";
+my $buri   = uri-of("{$*CWD.absolute}/t/fixtures/broken.raku");
 $ls.server.handle: { jsonrpc => '2.0', method => 'textDocument/didOpen',
     params => { textDocument => { uri => $buri, version => 1, text => $broken } } };
 $ls.server.handle: { jsonrpc => '2.0', id => 17, method => 'textDocument/definition',
@@ -63,7 +71,7 @@ $ls.server.handle: { jsonrpc => '2.0', id => 17, method => 'textDocument/definit
 # buffer's own `use` statements, so the lookup has to resolve the name itself as
 # a module. This is the `Cro::Transform` case — a file saying only `use Cro`.
 my $trans = "use Indirect::Front;\nmy Indirect::Leaf::Marker \$m;\n";
-my $turi  = "file://{$*CWD.absolute}/t/fixtures/deps/trans.raku";
+my $turi  = uri-of("{$*CWD.absolute}/t/fixtures/deps/trans.raku");
 $ls.server.handle: { jsonrpc => '2.0', method => 'textDocument/didOpen',
     params => { textDocument => { uri => $turi, version => 1, text => $trans } } };
 $ls.server.handle: { jsonrpc => '2.0', id => 18, method => 'textDocument/definition',
@@ -76,7 +84,7 @@ $ls.server.handle: { jsonrpc => '2.0', id => 19, method => 'textDocument/impleme
 
 # `gI` from INSIDE a consumer must not answer with that consumer's own line.
 my $inside = "use QualFixture;\nclass MyConsumer does Deep::Nested::Thing \{ \}\n";
-my $iuri   = "file://{$*CWD.absolute}/t/fixtures/inside.raku";
+my $iuri   = uri-of("{$*CWD.absolute}/t/fixtures/inside.raku");
 $ls.server.handle: { jsonrpc => '2.0', method => 'textDocument/didOpen',
     params => { textDocument => { uri => $iuri, version => 1, text => $inside } } };
 $ls.server.handle: { jsonrpc => '2.0', id => 20, method => 'textDocument/implementation',
@@ -85,7 +93,7 @@ $ls.server.handle: { jsonrpc => '2.0', id => 20, method => 'textDocument/impleme
 # directory. Editors do not always give a workspace root (Neovim reports
 # root=nil there), so the projects of the other open buffers have to be used.
 my $dep = "role Deep::Nested::Thing \{ \}\n";
-my $depuri = "file://{$*TMPDIR.absolute}/rls-dep-{$*PID}/sources/abc123";
+my $depuri = uri-of("{$*TMPDIR.absolute}/rls-dep-{$*PID}/sources/abc123");
 $ls.server.handle: { jsonrpc => '2.0', method => 'textDocument/didOpen',
     params => { textDocument => { uri => $depuri, version => 1, text => $dep } } };
 $ls.server.handle: { jsonrpc => '2.0', id => 21, method => 'textDocument/implementation',
@@ -93,7 +101,7 @@ $ls.server.handle: { jsonrpc => '2.0', id => 21, method => 'textDocument/impleme
 # `gd` while standing ON a declaration: jumping to it would not move, so what
 # implements it is offered instead.
 my $ondecl = "use QualFixture;\nrole LocalRole \{ \}\nclass UsesIt does LocalRole \{ \}\n";
-my $oduri  = "file://{$*CWD.absolute}/t/fixtures/ondecl.raku";
+my $oduri  = uri-of("{$*CWD.absolute}/t/fixtures/ondecl.raku");
 $ls.server.handle: { jsonrpc => '2.0', method => 'textDocument/didOpen',
     params => { textDocument => { uri => $oduri, version => 1, text => $ondecl } } };
 # cursor on `LocalRole` in its own `role LocalRole { }` declaration
@@ -109,9 +117,12 @@ $ls.server.handle: { jsonrpc => '2.0', id => 24, method => 'textDocument/referen
                 context => { includeDeclaration => True } } };
 $ofh.close;
 
-my $r = Raku::LanguageServer::Transport.new(:in($out.open(:r)), :out($null.open(:w)));
+my $read-fh = $out.open(:r);
+
+my $r = Raku::LanguageServer::Transport.new(:in($read-fh), :out($null.open(:w)));
 my %by-id;
 loop { my $m = $r.read-message; last unless $m.defined; %by-id{$m<id>} = $m if $m<id>:exists; }
+$read-fh.close;
 $out.unlink;
 
 my sub locs($id) { |(%by-id{$id}<result> // ()) }
